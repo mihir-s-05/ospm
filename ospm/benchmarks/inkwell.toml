@@ -1,0 +1,91 @@
+# Project context for "inkwell", the fictional OSS project used by the benchmarks and the demo.
+# (Template for your own project: copy this file and edit it.)
+# Point `ospm --project path/to/project.toml` at your own file to manage a real repository.
+
+[project]
+name = "inkwell"
+description = """
+inkwell is a fast, plugin-friendly static site generator written in Python. It turns a folder of Markdown
+files into a static HTML website using Jinja2 themes. CLI: `inkwell new`, `inkwell build`, `inkwell serve`.
+Configuration lives in `inkwell.toml`.
+"""
+in_scope = [
+  "Markdown parsing and rendering (CommonMark + extensions: tables, footnotes, front matter)",
+  "Jinja2 themes and templates, static assets",
+  "the command-line interface (new, build, serve with live reload)",
+  "plugin API and hooks",
+  "RSS/Atom feeds, sitemaps, taxonomies (tags, categories)",
+  "syntax highlighting, image processing for responsive images",
+  "internationalisation of generated sites",
+  "build performance and incremental builds",
+]
+out_of_scope = [
+  "hosting or deployment services (we document deploy recipes only)",
+  "a WYSIWYG/visual editor or admin panel",
+  "database-backed dynamic content, user accounts, comments or e-commerce",
+  "server-side rendering at request time",
+  "analytics or tracking services",
+]
+out_of_scope_keywords = ["wysiwyg", "admin panel", "user accounts", "shopping cart", "comment system"]
+conventions = [
+  "Library code under src/inkwell/ must use the `logging` module, never print() (the CLI module may print).",
+  "Never use a bare `except:`; catch specific exceptions.",
+  "TODO/FIXME comments must reference an issue, e.g. `# TODO(#123): ...`.",
+  "Every change to library code needs tests under tests/.",
+  "No breakpoint()/pdb in committed code.",
+  "No mutable default arguments.",
+  "No wildcard imports.",
+  "Public functions in library code (src/) need parameter and return type annotations.",
+]
+security_policy = "Report vulnerabilities privately to security@inkwell.dev; they are P0."
+roadmap = [
+  "1.0: stable plugin API",
+  "incremental builds and build performance",
+  "i18n: multilingual sites",
+]
+maintainers = ["ana", "bo", "chen"]
+library_paths = ["src/"]
+test_paths = ["tests/"]
+milestone_capacity = 12
+
+[[components]]
+name = "markdown"
+keywords = ["markdown", "commonmark", "footnote", "table", "front matter", "heading", "code block"]
+paths = ["src/inkwell/markdown/"]
+owners = ["ana"]
+
+[[components]]
+name = "themes"
+keywords = ["theme", "template", "jinja", "css", "layout", "partial"]
+paths = ["src/inkwell/themes/"]
+owners = ["bo"]
+
+[[components]]
+name = "cli"
+keywords = ["cli", "command", "serve", "build", "live reload", "watch", "new site"]
+paths = ["src/inkwell/cli.py"]
+owners = ["chen"]
+
+[[components]]
+name = "plugins"
+keywords = ["plugin", "hook", "extension api"]
+paths = ["src/inkwell/plugins/"]
+owners = ["ana", "chen"]
+
+[[components]]
+name = "feeds"
+keywords = ["rss", "atom", "feed", "sitemap", "taxonomy", "tags"]
+paths = ["src/inkwell/feeds/"]
+owners = ["bo"]
+
+[[components]]
+name = "i18n"
+keywords = ["i18n", "translation", "multilingual", "language", "locale"]
+paths = ["src/inkwell/i18n/"]
+owners = ["chen"]
+
+[[components]]
+name = "assets"
+keywords = ["image", "images", "asset", "responsive", "highlighting", "syntax highlighting"]
+paths = ["src/inkwell/assets/"]
+owners = ["bo"]

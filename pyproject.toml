@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ospm"
+version = "0.1.0"
+description = "Self-evolving multi-agent project manager for open-source repositories (non-parametric evolution)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.72"]
+openai = ["openai>=2.0"]
+dev = ["pytest>=8"]
+all = ["anthropic>=0.72", "openai>=2.0", "pytest>=8"]
+
+[project.scripts]
+ospm = "ospm.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ospm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: calls a real LLM API (deselect with -m 'not live')"]
+addopts = "-m 'not live'"
+
+[tool.setuptools.package-data]
+ospm = ["benchmarks/*.toml"]

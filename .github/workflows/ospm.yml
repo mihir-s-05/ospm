@@ -1,0 +1,104 @@
+# ospm: AI project manager for this repository.
+#
+# Setup
+#   1. Copy ospm/benchmarks/inkwell.toml to .github/ospm/project.toml and describe YOUR project
+#      (scope, components/owners, conventions, maintainers - maintainers' labels and /ospm commands are
+#      treated as ground-truth feedback).
+#   2. Add an OPENAI_API_KEY (or ANTHROPIC_API_KEY, then set OSPM_LLM=anthropic) repository secret.
+#   3. Set OSPM_SOURCE below to where ospm can be pip-installed from.
+#
+# Security: PR events use pull_request_target so fork PRs get a comment, but this workflow NEVER checks out
+# or executes PR code - the diff and CI logs are fetched through the REST API and only read as text.
+name: ospm
+
+on:
+  issues:
+    types: [opened, reopened, labeled]
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  workflow_run:
+    workflows: ["CI"]          # name of your CI workflow; failed runs get a root-cause analysis
+    types: [completed]
+  schedule:
+    - cron: "17 3 * * 1"       # weekly self-evolution
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  actions: read
+  checks: read
+
+# one job at a time: they all read and write the same memory database
+concurrency:
+  group: ospm-memory
+  cancel-in-progress: false
+
+env:
+  OSPM_SOURCE: "git+https://github.com/OWNER/ospm.git"   # <- change me
+  OSPM_LLM: openai
+  OSPM_DB: .ospm/memory.db
+  OSPM_PROJECT: .github/ospm/project.toml
+
+jobs:
+  manage:
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4   # base branch only (project.toml); PR code is never checked out
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "ospm[openai,anthropic] @ ${OSPM_SOURCE}"
+      - name: Restore memory
+        uses: actions/cache/restore@v4
+        with:
+          path: .ospm
+          key: ospm-memory-${{ github.run_id }}
+          restore-keys: ospm-memory-
+      - name: Handle event
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OSPM_BUDGET_USD: "0.25"   # hard cap per event
+        run: ospm gh-event --apply
+      - name: Save memory
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ospm
+          key: ospm-memory-${{ github.run_id }}
+
+  evolve:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "ospm[openai,anthropic] @ ${OSPM_SOURCE}"
+      - uses: actions/cache/restore@v4
+        with:
+          path: .ospm
+          key: ospm-memory-${{ github.run_id }}
+          restore-keys: ospm-memory-
+      - name: Evolve agents from accumulated feedback (GEPA) and promote winners
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OSPM_BUDGET_USD: "2.00"
+        run: |
+          ospm evolve --agent all --iterations 30 --no-benchmark | tee evolution.md
+          cat evolution.md >> "$GITHUB_STEP_SUMMARY"
+      - if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ospm
+          key: ospm-memory-${{ github.run_id }}
