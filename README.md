@@ -1,222 +1,156 @@
-# ospm — a self-evolving OSS project-manager agent
+# ospm: a self-evolving OSS project-manager agent
 
-`ospm` is a multi-agent project manager for open-source repositories. It triages issues, grooms and plans the
-backlog, diagnoses CI failures, reviews pull requests for project conventions and security problems, and
-proposes releases. It also improves itself over time through **non-parametric evolution**: the LLM's weights
-never change. What changes is each agent's *genome*: its natural-language policy, a playbook of executable
-rules, retrieval and scoring parameters, and pinned few-shot examples. Evolution is driven by maintainer
-feedback and a **GEPA**-style reflective search.
+`ospm` is a multi-agent project manager for open-source repositories. It triages issues, diagnoses CI failures,
+reviews pull requests and plans releases. It also improves itself without retraining: what evolves is its
+prompts, rules, skills, agent types and team coordination, never the model's weights.
 
-```
-                         ┌───────────────────────── persistent memory (SQLite) ─────────────────────────┐
-                         │ episodes · labelled cases · genomes + lineage · promotions · rule credit ·    │
-                         │ LLM response cache                                                           │
-                         └──────▲──────────────────────▲────────────────────────────▲───────────────────┘
-   new issue ──► TriageAgent ───┤  backlog ──► BacklogPlanner ──► milestones ──► release planner
-                 (valid? scope? kind? priority? duplicate?)          │
-   pull request ─┬► CITriageAgent  (per failed job: category, root cause, fix, retry?)
-                 ├► ReviewAgent    (project conventions, file/line comments)       ──► merge-readiness verdict
-                 └► SecurityAgent  (injection, secrets, TLS, deserialisation, …)
-   maintainer feedback (labels, /ospm commands) ──► memory ──► GEPA evolution ──► promotion gate ──► live genome
-```
+To test that honestly, `ospm` includes a **replay environment** built from real repository history. An agent
+handles a real event (an issue opened, a PR ready for review, a CI job failing) exactly as the repository was at
+that moment, and is scored against what the maintainers actually did.
 
-## Agent team on replayed real history (new)
+## Principles
 
-Tool-using agents built like mini-swe-agent v2, an orchestrator that delegates to specialists, a leak-proof replay environment built from pytest-dev/pytest's real history, and **Team-GEPA** (blame-directed, invocation-cached, cost-aware GEPA). See [`docs/AGENT_TEAM.md`](docs/AGENT_TEAM.md).
+1. **Reality is the benchmark.** Ground truth comes from maintainers' real decisions, not labels we wrote.
+2. **No peeking at the future.** Every view of the repository is frozen at the event time. Each leak we found
+   (later comments, commits pushed after a review, future git refs) has a regression test.
+3. **Improve the system, not the weights.** Changes are readable text (rules, skills, agent descriptions), so
+   they are cheap, auditable and reversible.
+4. **Nothing is adopted without independent evidence.** A learned change is kept only if replaying *other*,
+   earlier PRs shows it helps, without new false alarms or (for teams) extra cost.
+5. **Measure the measurement.** The scoring rule was itself validated against hand-labelled data, and replaced
+   when it turned out to be wrong.
 
-## Why this design
+## What is in it
 
-| Requirement from the brief | Where it lives |
-|---|---|
-| Validate new issues and check scope | `TriageAgent` (`ospm/agents/triage.py`): kind / decision (accept, needs-info, out-of-scope, duplicate, spam) / priority, duplicate detection against the tracker, a reply to the reporter, suggested labels |
-| Backlog prioritisation, grooming, assignment | `BacklogPlanner` (`ospm/agents/planning.py`): explainable score (priority, reactions, age, roadmap fit, regressions), readiness, owners from components, capacity-bounded milestones |
-| Help contributors whose PRs fail CI | `CITriageAgent` (`ospm/agents/ci_triage.py`): salient-line extraction across ecosystems (pytest, go, jest, cargo, gradle, docker, npm, scanners), failing tests, root-cause line, concrete fix, re-run advice for flaky infra |
-| Project conventions and review guidelines | `ReviewAgent` (`ospm/agents/diff_agents.py`): conventions from the project file, findings located to `file:line` |
-| Security review | `SecurityAgent`: secrets, SQL/command injection, unsafe deserialisation, disabled TLS, weak crypto, path traversal, eval/exec |
-| Roadmap and release scheduling | `plan_release`: semver bump from conventional commits/labels (pre-1.0 aware), grouped release notes |
-| Specialised agents + shared memory | `ProjectManager` (`ospm/manager.py`) + `Memory` (`ospm/memory.py`) |
-| Evaluation metrics | `ospm/evolution/metrics.py`, labelled benchmarks in `ospm/benchmarks/` |
-| Self-improvement (non-parametric evolution) | `ospm/evolution/` — GEPA engine, reflective operators, promotion gate |
+| part | what it does | where |
+|---|---|---|
+| Replay environment | Mirrors a repository's issues, PRs, reviews, CI runs and logs. Builds time-frozen workspaces and tasks with maintainer ground truth (triage, review, CI, review concerns). Handles PyTorch's ghstack and bot-landed PRs. | `ospm/replay/` |
+| `hist` | The agents' command-line view of history as of the event: issues, PRs and discussions, earlier maintainer review comments on a file (`hist reviews --path`), CI runs and logs, commits. | `ospm/replay/hist.py` |
+| Agent harness | mini-swe-agent-style agents (bash, git, local test runs) with a sandbox, context compaction and hierarchical traces. | `ospm/harness/` |
+| Agent team | An orchestrator runs specialists in the background, like Claude Code's subagents: spawn, message, wait, close, resume. It sees only each specialist's final message and work report. The specialists form an evolvable **library of agent types**. | `ospm/team/` |
+| Learning | GEPA and Team-GEPA prompt evolution; validated scoped lessons; **skills** evolved by post-mortems of traces; **team evolution** of agent types, the library and coordination rules, with per-agent credit and cost-aware acceptance. | `ospm/evolution/`, `ospm/learning/` |
+| Semantic judge | Decides whether an agent's comment raises the same concern as a maintainer's, using TypeSafe's Jev (a calibrated true/false model). | `ospm/replay/semantic.py` |
 
-## How an agent decides
-
-Every agent is **hybrid**, and its genome configures both modes:
-
-1. **Heuristic policy** (free, deterministic, always available): playbook rules + k-NN votes from labelled past
-   cases (TF-IDF retrieval) + structural signals (log structure, diff paths, link counts, …).
-2. **LLM policy** (optional): the same playbook, the retrieved cases, pinned exemplars and the heuristic
-   pre-assessment go into a schema-constrained LLM call. If the call fails or the budget is spent, the agent
-   falls back to the heuristic decision instead of failing.
-
-Because playbook rules are both executable and rendered into the prompt, one learned lesson improves both modes.
-
-## Two learning loops
-
-**Online (immediate, no search).** Each decision is stored as an episode. When a maintainer corrects or confirms
-it (adds a label, or comments `/ospm triage priority=P1`), the labelled case enters retrieval memory, so the next
-similar item benefits right away. The rules that fired get credit or blame. In the demo's cold-start stream of
-96 issues, mean triage score rises from **0.61 → 0.67 → 0.80** over successive thirds using memory alone.
-
-**Offline: GEPA evolution** (`ospm/evolution/gepa.py`), after Agrawal et al., *GEPA: Reflective Prompt Evolution
-Can Outperform Reinforcement Learning*:
-
-* **Reflective mutation.** Run the parent on a minibatch of training cases and attach natural-language feedback
-  (what was wrong, which rules fired). Then mutate one *module* of the genome, round-robin per candidate:
-  * `reflection`: an LLM diagnoses the failure patterns and rewrites the policy, adding, removing and re-weighting
-    rules (validated before use; invalid regexes are dropped);
-  * `induction`: an offline analyst induces precise phrase rules (precision, support and *lift over base
-    rate*) from failures, and vetoes or demotes rules that misfired;
-  * `params`: bounded jitter of retrieval and scoring knobs;
-  * `exemplars`: re-pins few-shot cases covering the labels the agent gets wrong.
-* **Pareto-based selection.** Each candidate keeps per-instance scores on the Pareto (val) set. Parents are
-  sampled from the non-dominated candidates, weighted by how many instances they are best on, so the search
-  keeps diverse specialists instead of collapsing onto one average.
-* **System-aware merge.** For two Pareto candidates with a common ancestor, take each module from the side that
-  evolved it (playbooks are unioned when both changed).
-* **Staged evaluation (FlashEvolve-style acceleration).** Content-addressed genomes and a `(genome, example)`
-  decision cache mean no genome is re-run on the same case. LLM responses are cached persistently, evaluation is
-  parallel, and a gate runs minibatch → full train (no regression, heuristic mode) → Pareto set. Most bad
-  children are rejected cheaply.
-* **Promotion gate.** The best candidate goes live only if it beats the *currently deployed* genome on the
-  Pareto set by `min_delta` without regressing on train. The held-out **test** split is reported and never
-  used for any decision. Every run, candidate, lineage edge and promotion is recorded.
-
-Splits follow GEPA's protocol: *train* = feedback and minibatch source (and the k-NN memory), *val* = Pareto and
-selection set, *test* = held out.
+Design details: [`docs/AGENT_TEAM.md`](docs/AGENT_TEAM.md) (harness, team, replay),
+[`docs/LEARNING.md`](docs/LEARNING.md) (tasks, methods, all results),
+[`docs/DATA_AUDIT.md`](docs/DATA_AUDIT.md) (where interventions could have helped).
 
 ## Results
 
-Benchmarks: the bundled fictional project **inkwell** (a static-site generator) with hand-labelled data:
-96 issues, 48 CI logs across 8 categories, and 40 pull requests with review and security labels. Splits are
-stratified 60/20/20.
+All agent runs use **GPT-6 Luna**. The main task replays a maintainer's review of a PR: the agent reviews the exact
+commit the maintainer saw and is scored on whether it raises the maintainer's concerns. On PRs maintainers approved
+as-is, it is scored on staying silent. Splits are chronological: learn on older PRs, test on newer ones.
 
-**Heuristic policy, offline GEPA (no LLM, ~1 s per run), mean over seeds 0–2, 40 iterations:**
+**1. Measurement.** The original match rule ("same file, within 5 lines") was checked against 104 hand-labelled
+pairs:
 
-| agent | val: seed → evolved | **test: seed → evolved** |
-|---|---|---|
-| CI triage | 0.60 → 0.70 | **0.78 → 0.89** (all seeds) |
-| issue triage | 0.72 → 0.74 | **0.77 → 0.78** (never below seed) |
-| review / security | unchanged | unchanged: these need regex-level lessons, which LLM reflection provides |
+| judge | AUC | accuracy | precision | recall |
+|---|---:|---:|---:|---:|
+| ±5-line rule | 0.78 | 0.83 | 0.59 | 0.70 |
+| **Jev** (TypeSafe; used now, p ≥ 0.8) | **0.999** | **0.99** | **1.00** | **0.96** |
+| OpenAI Decisions API (gpt-6-luna, p ≥ 0.5) | 1.000 | 0.97 | 1.00 | 0.87 |
 
-**LLM policy (`gpt-6-luna`), seed genomes** (224 calls, $0.07 for all four agents × all splits):
+Jev is now the default scorer (`--match semantic`), and every run below was rescored with it. It costs about $0.03
+per thousand judgements.
 
-| agent | train | val | test |
-|---|---:|---:|---:|
-| issue triage | 0.936 | 0.932 | 0.947 |
-| CI triage | 1.000 | 1.000 | 1.000 |
-| review | 1.000 | 1.000 | 1.000 |
-| security | 0.958 | 0.875 | 1.000 |
+**2. What the reviewer catches** (semantic recall of maintainer concerns on the test PRs):
 
-**GEPA with GPT-6 Luna as the reflector, evolving the *free* heuristic policy** (24 iterations each):
+| repository | plain reviewer | + memory | + lessons | + `hist reviews` tool | + evolved skills | team (orchestrator + specialists) |
+|---|---:|---:|---:|---:|---:|---:|
+| vLLM | 0.00–0.02 | 0.00–0.04 | = plain | | | |
+| SGLang | 0.10 | 0.09 | = plain | 0.13 | 0.13 | 0.08 (0.12 with the tool) |
 
-| agent | val: seed → evolved | **test: seed → evolved** | reflection cost |
-|---|---|---|---:|
-| review | 0.75 → 0.83 | **0.71 → 0.875** | $0.010 |
-| security | 0.75 → 0.875 | 0.50 → 0.50 (8-item test set; no transfer) | $0.012 |
+- **No method has beaten the plain reviewer yet.** Validated lessons: 0 of 57 adopted on vLLM and SGLang (2 on
+  pytest, which never applied to a test PR). Evolved skills: 1 of 31 adopted. Every other difference is within
+  noise.
+- **The team matches one reviewer at about twice the cost.** Traces show coordination loses nothing: every
+  concern a specialist found reached the final answer. But it adds nothing either. The orchestrator re-read the
+  diff itself, rarely followed up, and spawned a security agent that never commented.
+- **What gets found** is concrete bugs: 29% of correctness concerns, pooled over four runs. Design objections
+  and test gaps were never found. 52–63% of maintainer concerns on vLLM, SGLang and PyTorch need knowledge beyond
+  the diff.
+- **In progress:**
+  - **Team evolution on SGLang.** Its first adopted change, learned and validated on its own, is a coordination rule:
+    *"Do not spawn security by default; spawn it for security-sensitive changes."*
+  - **The same experiments on PyTorch.**
 
-Here the LLM writes regex-level playbook rules (mutable defaults, missing annotations, deserialisation sinks)
-that the zero-cost policy then runs with no LLM in the loop.
+**3. Data audit** (pytest, pip, pydantic). Defects that surface after merge are rare (about 2% of PRs), and their
+evidence almost always existed at review time. Hence the focus on review.
 
-**GEPA with GPT-6 Luna as both reflector and policy** (triage, 24 iterations, 300 calls, $0.10): several
-reflections improved minibatches, but none beat the incumbent on the Pareto set (0.932 at its ceiling), so the
-gate kept the seed (test 0.947). With a strong policy model this benchmark is close to saturated. Gains need
-harder or larger data, which is what real repository feedback provides.
+**4. Synthetic benchmark** (`inkwell`, a hand-labelled fictional project: 96 issues, 48 CI logs, 40 PRs). It was
+the first test bed for the agents and GEPA.
+- **Rule-based agents improved under evolution.** CI-triage test score went from 0.78 to 0.89, and review from 0.71
+  to 0.875.
+- **LLM agents were already at 0.93–1.0**, so the benchmark saturated. That is why we moved to real history.
 
-Two genuine defects were found *by* live evaluation and fixed (each with a regression test): relational labels
-("duplicate") leaking into the LLM prompt via retrieved neighbours, which made the LLM mark *originals* as
-duplicates (triage val 0.910 → 0.932 after the fix); and a crash in prompt rendering for multi-label neighbours.
-Two inconsistencies the model pointed out were also corrected: a benchmark PR used AWS's documented placeholder key as its "leaked secret", and the project file's type-hint convention did not say it applies only to library code (as the labels assumed).
-
-Small benchmarks make val and test noisy (8–19 items). Treat single-run differences of one item as noise. That is
-why the promotion gate exists and test is reported separately.
+All experiments so far cost about $25 of API usage.
 
 ## Quick start
 
 ```bash
-pip install -e ".[all]"          # Python ≥ 3.11; the core has no third-party dependencies
-pytest                           # 80 offline tests (live API tests: pytest -m live, 4 tests)
-
-ospm demo                        # whole pipeline + both learning loops on 'inkwell', offline, in seconds
-ospm --llm openai demo           # same, with GPT-6 Luna as policy/reflector (costs cents)
+pip install -e ".[all]"   # Python >= 3.11
+pytest                    # 211 offline tests (live API tests: pytest -m live)
+ospm demo                 # agents + both learning loops on the synthetic project, offline
 ```
 
-Everyday commands (add `--llm openai|anthropic` to use an LLM, `--json` for machine output):
+Replay a real repository (needs `GITHUB_TOKEN`; `OPENAI_API_KEY` for agents; `TYPESAFE_API_KEY` for the judge):
 
 ```bash
-ospm triage --title "Crash on serve" --body "Traceback ..."        # or --github owner/repo#123 [--apply]
-ospm ci --log failed-job.log
-ospm review --diff change.diff                                      # or --github owner/repo#45 [--apply]
-ospm backlog --github owner/repo --milestones v1.1,v1.2
-ospm release --github owner/repo                                    # next version + release notes
-ospm feedback --agent triage --item issue-123 --set decision=duplicate priority=P3
-ospm eval --agent all --split all
-ospm evolve --agent triage --iterations 30 [--reflection openai] [--policy-llm]
-ospm memory stats | genome triage | promotions | runs | lineage RUN_ID | rules triage
+ospm mirror sgl-project/sglang --since 2026-06-01 --out data/sglang --blobless   # history + bare clone
+ospm replay tasks --data data/sglang                                              # tasks + ground truth
+python -m ospm.replay.concern_labels --data data/sglang --batch                   # concern taxonomy (Batch API)
+
+# single reviewer: plain / memory / tool / evolved skills, learned on older PRs, tested on newer ones
+python -m ospm.learning.experiment --data data/sglang --train 64 --test 48 \
+    --systems none,memory,tool,skills --budget 6
+# the team: agent library + team evolution
+python -m ospm.learning.team_evolution --data data/sglang --train 32 --test 32 --budget 9
+# rescore a finished run with the semantic judge (no new episodes)
+python -m ospm.learning.rescore --data data/sglang --result data/results/learning_sglang_skills.json
 ```
 
-GitHub writes are **dry-run unless `--apply`** is given.
+Everyday commands (add `--llm openai|anthropic`, `--json` for machine output):
 
-## Using it on your repository
+```bash
+ospm triage --title "Crash on serve" --body "..."     # or --github owner/repo#123 [--apply]
+ospm ci --log failed-job.log
+ospm review --diff change.diff                         # or --github owner/repo#45 [--apply]
+ospm release --github owner/repo
+ospm evolve --agent triage --iterations 30 [--reflection openai]
+```
 
-1. Copy `ospm/benchmarks/inkwell.toml` and describe your project: scope, out-of-scope keywords,
-   components with paths and owners, conventions, roadmap, and maintainers. Maintainers' labels and `/ospm`
-   commands count as ground truth.
-2. Add `.github/workflows/ospm.yml` (included). It triages new issues, reviews PRs (`pull_request_target`,
-   never executing PR code), explains failed CI runs, learns from maintainer labels and `/ospm` comments, and
-   runs evolution weekly. Memory persists through the Actions cache.
-3. Projects other than inkwell learn only from their own feedback. `evolve` waits until there are labelled
-   cases in both train and val (about 5+).
+GitHub writes are dry-run unless `--apply` is given. `.github/workflows/ospm.yml` runs triage, review and CI
+explanations on a repository and learns from maintainers' labels and `/ospm` comments.
 
-## Configuration and cost control
+## Cost control
 
 | env var | meaning |
 |---|---|
-| `OSPM_LLM` | `none` (default), `openai`, `anthropic`, `auto` |
-| `OSPM_MODEL` | defaults: `gpt-6-luna` (OpenAI), `claude-opus-5-5` (Anthropic) |
-| `OSPM_BUDGET_USD` | **hard per-process spend cap** (default 2.00). Checked before every call; agents fall back to heuristics when it is reached |
-| `OSPM_DB`, `OSPM_PROJECT` | memory file, project TOML |
-| `GITHUB_TOKEN` / `GH_TOKEN` | GitHub API (needed for CI job logs and writes) |
+| `OSPM_LLM`, `OSPM_MODEL` | provider (`none`, `openai`, `anthropic`, `auto`) and model (default `gpt-6-luna`) |
+| `OSPM_BUDGET_USD` / `--budget` | hard per-process spend cap, checked before every call |
+| `OPENAI_API_KEY`, `TYPESAFE_API_KEY`, `GITHUB_TOKEN` | agents, semantic judge, mirroring |
 
-Backends use structured outputs: OpenAI's Responses API with a strict JSON schema, and Anthropic's Messages API
-with `output_config.format`, cached system prompts and server-side refusal fallbacks (`fallbacks: "default"`).
-Every response is validated against the schema again locally. Both wire formats are tested against the real
-SDKs through a mocked transport (`tests/test_llm.py`).
+Episodes, judgements and reflector answers are cached on disk, so interrupted runs resume without paying twice.
+Rate-limited episodes wait and rerun instead of failing the experiment.
 
 ## Layout
 
 ```
 ospm/
-  agents/        base (hybrid policy), triage, ci_triage, diff_agents (review, security), planning
-  evolution/     gepa (engine), operators (reflection, induction, params, exemplars, merge), metrics
-  benchmarks/    labelled data (issues, CI logs, PRs), inkwell.toml, stratified splits
-  llm/           provider-neutral interface, OpenAI + Anthropic backends, fake, budget meter
-  integrations/  GitHub REST client (dry-run by default), event handling and feedback parsing
-  manager.py     the SDLC orchestrator      memory.py   SQLite memory     genome.py  genomes and rules
-  cli.py · render.py · demo.py
-tests/           offline suite + opt-in live tests
+  replay/     mirror, time-frozen store and workspaces, hist CLI, tasks, scoring, semantic judge, ghstack
+  harness/    mini-swe-agent-style agent loop, sandboxed environment, provider wire formats
+  team/       roles and the agent-type library, asynchronous team runner
+  learning/   experiments: interventions, skills + post-mortem, team evolution, rescoring
+  evolution/  GEPA and Team-GEPA
+  agents/ llm/ integrations/ benchmarks/   original hybrid agents, LLM backends, GitHub client, synthetic data
+tests/        offline suite (fake models and stubbed judges)
+docs/         design notes and full results
 ```
-
-## Capstone milestones this supports
-
-1. **Single-purpose agent**: run `TriageAgent` alone (`ospm triage`, `ospm eval --agent triage`).
-2. **Specialised agents + orchestration**: `ProjectManager.review_pr` combines CI triage, review and security
-   into one verdict.
-3. **Shared memory + metrics**: episodes, cases and rule credit; per-field accuracy and macro/micro-F1.
-4. **Self-improvement**: GEPA over instructions, playbook, params and exemplars, with lineage and a promotion gate.
-5. **Research extensions**: other selection schemes (MAP-Elites), cost-aware multi-objective Pareto
-   (score vs. tokens), RL-tuned operator scheduling, adversarial-testing and soak-test agents, and cross-project
-   transfer of playbooks.
-
-## Limitations
-
-* Benchmarks are small and synthetic (but hand-written and checked against their labelling definitions in
-  tests). Larger, real repository histories are the next step.
-* Offline induction learns lexical rules only. Structural patterns (regexes) come from LLM reflection.
-* The backlog score and release planner are transparent heuristics; they are not learned.
 
 ## References
 
-* *Position: Agentic Evolution is the Path to Evolving LLMs*
-* Agrawal et al., *GEPA: Reflective Prompt Evolution Can Outperform Reinforcement Learning* (2025)
-* *FlashEvolve: Accelerating Agent Self-Evolution*
-* Novikov et al., *AlphaEvolve: A Gemini-powered coding agent for designing advanced algorithms* (2025)
+- Agrawal et al., *GEPA: Reflective Prompt Evolution Can Outperform Reinforcement Learning* (2025)
+- *mini-swe-agent* (SWE-agent team): the harness design
+- *Agentic Context Engineering* (ACE): the memory baseline
+- Śliwerski et al., *When do changes induce fixes?* (SZZ), used in the data audit
+- *Position: Agentic Evolution is the Path to Evolving LLMs*; *FlashEvolve*; Novikov et al., *AlphaEvolve* (2025)
