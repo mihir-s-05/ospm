@@ -39,6 +39,7 @@ class Skill:
     status: str = "active"  # candidate | active | rejected
     validation: dict = field(default_factory=dict)
     version: int = 1
+    items: list[dict] = field(default_factory=list)  # a rubric area's items (ospm/learning/rubric.py); body = render
 
     def __post_init__(self) -> None:
         self.name = slug(self.name)
@@ -47,8 +48,9 @@ class Skill:
 
 
 def offered(skills: list[Skill], files: list[str], role: str = "review", k: int = 8) -> list[Skill]:
-    def hit(s: Skill) -> bool:
-        return not s.paths or any(fnmatch.fnmatch(f, pat) for f in files for pat in s.paths)
+    def hit(s: Skill) -> bool:  # fnmatch's * crosses "/"; "a/**/b" also matches "a/b"
+        pats = [q for p in s.paths for q in {p, p.replace("/**/", "/")}]
+        return not s.paths or any(fnmatch.fnmatch(f, pat) for f in files for pat in pats)
 
     ok = [s for s in skills if s.status == "active" and s.role == role and hit(s)]
     ok.sort(key=lambda s: (not s.paths, s.name))
@@ -69,6 +71,13 @@ def index_block(skills: list[Skill]) -> str:
     return ("\n\n## Skills\nEach skill is a procedure for this repository, learned from earlier reviews. When the "
             "change touches its area, load it with `skill <name>` (`skill` alone lists them) and follow it.\n"
             + "\n".join(lines))
+
+
+def rubric_block(skills: list[Skill]) -> str:
+    if not skills:
+        return ""
+    return ("\n\n## Review rubric\nRules this repository's maintainers have applied repeatedly in earlier reviews, "
+            "for the areas this change touches.\n\n" + "\n\n".join(f"### {s.name}\n{s.body.strip()}" for s in skills))
 
 
 def loaded_skills(trace: dict) -> list[str]:

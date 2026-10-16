@@ -50,6 +50,8 @@ STEPS_LEFT_NOTE = (
     f"ends without a submission produces no output at all). Submit with a command whose output starts with "
     f"{SUBMIT_MARKER}."
 )
+STUCK_NOTE = ("You have run the same command {n} times in a row. Its output will not change: try a different "
+              "approach, or submit what you have.")
 FINAL_TURN = (
     "You have reached the step limit. This is your last turn: submit your final output now, based on what you have "
     f"found so far, with a command whose output starts with {SUBMIT_MARKER}. No other command will run."
@@ -59,6 +61,15 @@ SUMMARY_SYSTEM = (
     "factual summary that preserves: the task goal; every concrete finding with evidence (file paths, line "
     "numbers, issue/PR numbers, test names, error lines, command results); what was ruled out; decisions made; "
     "open questions; and the immediate next steps. No preamble."
+)
+# client-side compaction asks for the summary at the END of the conversation, so the request extends the cached
+# prefix of the last call instead of re-reading the whole history under a different system prompt
+COMPACTION_INSTRUCTION = (
+    "You are now acting as a compaction engine: do not call any tool. Summarise the conversation ABOVE so you can "
+    "continue without it. Write a dense, factual summary that preserves: the task goal; every concrete finding with "
+    "evidence (file paths, line numbers, issue/PR numbers, test names, error lines, command results); what was ruled "
+    "out; decisions made; open questions; and the immediate next steps. Output only the summary, without preamble "
+    "and without mentioning this request."
 )
 
 
@@ -91,6 +102,11 @@ class AgentConfig:
     effort: str | None = "medium"
     max_tokens: int = 16000
     text_mode: bool = False
+    stuck_warn: int = 5  # identical consecutive tool-call batches before a nudge (0 = off)
+    stuck_stop: int = 8  # ... before the agent is stopped, if every one of them failed (0 = off)
+    elide_tokens: int = 0  # past this context size, cut stale tool outputs before compacting (0 = off)
+    elide_keep: int = 6  # the most recent tool results are never elided
+    elide_min_chars: int = 1200  # shorter outputs are kept
 
 
 @dataclass
@@ -103,7 +119,8 @@ class Step:
     output_tokens: int
     cost: float
     t: float
-    event: str = ""  # "compaction" | "format_error" | "final_turn" | "message" (delivered inbox text in results) | ""
+    # "compaction" | "elision" | "stuck" | "format_error" | "final_turn" | "message" (text in results[0]) | ""
+    event: str = ""
 
 
 @dataclass
@@ -146,8 +163,8 @@ class Trace:
             if s.event == "compaction":
                 lines.append(f"{pad}[step {s.n}] (context compacted)")
                 continue
-            if s.event == "message":
-                lines.append(f"{pad}[step {s.n}] message: {s.results[0]['output'][:600]}")
+            if s.event in ("message", "stuck", "elision"):
+                lines.append(f"{pad}[step {s.n}] {s.event}: {s.results[0]['output'][:600]}")
                 continue
             if s.text.strip():
                 lines.append(f"{pad}[step {s.n}] thought: {s.text.strip()[:400]}")
@@ -222,6 +239,9 @@ class Agent:
         self._inbox: list[str] = []
         self._inbox_lock = threading.Lock()
         self._closed = threading.Event()
+        self._streak = 0  # consecutive steps with an identical tool-call batch
+        self._streak_key = ""
+        self._streak_failed = True  # every step of the streak failed
 
     # ------------------------------------------------------------------ public API
     def run(self, **template_vars: Any) -> AgentResult:
@@ -285,12 +305,13 @@ class Agent:
                 if 0 < self.cfg.step_limit and left <= 3 and not warned and self.cfg.step_limit > 6:
                     warned = True
                     self.conv.add_user(STEPS_LEFT_NOTE.format(n=left))
+                self._maybe_elide()
                 self._maybe_compact()
                 self._step()
             except Submitted as s:
                 return self._finish(s.submission, "Submitted")
             except LimitsExceeded as e:
-                if not str(e).startswith("step limit"):
+                if not str(e).startswith(("step limit", "stuck")):
                     return self._finish("", f"LimitsExceeded: {e}")
                 return self._final_turn(str(e))
             except (LLMError, BudgetExceeded) as e:
@@ -300,6 +321,7 @@ class Agent:
         """At the step limit the agent gets one last turn to submit what it has, instead of losing all its work."""
         assert self.conv is not None
         self.conv.add_user(FINAL_TURN)
+        self._streak_key = ""
         self.trace.steps.append(Step(self.n_steps, "", [], [], 0, 0, 0.0, time.time(), event="final_turn"))
         try:
             self._step()
@@ -328,14 +350,45 @@ class Agent:
         if 0 < self.cfg.wall_time_limit <= time.time() - self._start:
             raise LimitsExceeded(f"wall time {self.cfg.wall_time_limit}s")
 
+    def _maybe_elide(self) -> None:
+        assert self.conv is not None
+        if self.cfg.elide_tokens <= 0 or self.conv.context_tokens < self.cfg.elide_tokens:
+            return
+        removed = self.conv.elide(self.cfg.elide_keep, self.cfg.elide_min_chars)
+        if removed:
+            out = {"id": "", "output": f"elided {removed} characters", "is_error": False}
+            self.trace.steps.append(Step(self.n_steps, "", [], [out], 0, 0, 0.0, time.time(), event="elision"))
+            self.log(f"[{self.id}] elided {removed} characters of stale tool output")
+
+    def _track_stuck(self, calls: list[ToolCall], failed: bool) -> None:
+        """Count consecutive identical batches: nudge at `stuck_warn`, stop at `stuck_stop` if all of them failed."""
+        key = json.dumps([(c.name, c.arguments) for c in calls], sort_keys=True, default=str)
+        if key == self._streak_key:
+            self._streak += 1
+            self._streak_failed = self._streak_failed and failed
+        else:
+            self._streak_key, self._streak, self._streak_failed = key, 1, failed
+        n = self._streak
+        if n == self.cfg.stuck_warn > 0:
+            note = STUCK_NOTE.format(n=n)
+            self.conv.add_user(note)
+            out = {"id": "", "output": note, "is_error": False}
+            self.trace.steps.append(Step(self.n_steps, "", [], [out], 0, 0, 0.0, time.time(), event="stuck"))
+        if 0 < self.cfg.stuck_stop <= n and self._streak_failed:
+            raise LimitsExceeded(f"stuck: the same failing command {n} times")
+
     def _maybe_compact(self) -> None:
         assert self.conv is not None
         if (self._native_compaction or self.cfg.compaction_tokens <= 0
                 or self.conv.context_tokens < self.cfg.compaction_tokens):
             return
-        transcript = self.trace.render(max_obs=1500)
-        summary = self.model.complete(SUMMARY_SYSTEM, f"Transcript to compress:\n\n{transcript[-400_000:]}",
-                                      effort="low")
+        turn = self.conv.side_query(COMPACTION_INSTRUCTION, effort="low")
+        self.cost += turn.cost
+        summary = turn.text
+        if not summary.strip():  # it called a tool instead: fall back to a separate summariser call
+            transcript = self.trace.render(max_obs=1500)
+            summary = self.model.complete(SUMMARY_SYSTEM, f"Transcript to compress:\n\n{transcript[-400_000:]}",
+                                          effort="low")
         last_obs = ""
         for s in reversed(self.trace.steps):
             if s.results:
@@ -346,7 +399,8 @@ class Agent:
                    "above replaces your earlier turns. Continue the task from where it leaves off.")
         self.conv.compact(message)
         self.trace.compactions += 1
-        self.trace.steps.append(Step(self.n_steps, "", [], [], 0, 0, 0.0, time.time(), event="compaction"))
+        self.trace.steps.append(Step(self.n_steps, "", [], [], turn.input_tokens, turn.output_tokens,
+                                     round(turn.cost, 6), time.time(), event="compaction"))
         self.log(f"[{self.id}] context compacted")
 
     def _step(self) -> None:
@@ -362,23 +416,28 @@ class Agent:
         if self.cfg.text_mode:
             actions = _TEXT_ACTION.findall(turn.text)
             if len(actions) != 1:
+                self._streak_key = ""
                 self._record(turn, [], [], "format_error")
                 self.conv.add_user(FORMAT_ERROR_TEXT)
                 return
             calls = [ToolCall(f"text-{self.n_steps}", "bash", {"command": actions[0]})]
         elif not calls:
+            self._streak_key = ""
             self._record(turn, [], [], "format_error")
             self.conv.add_user(FORMAT_ERROR_TOOLS)
             return
 
         results: list[ToolResult | None] = [None] * len(calls)
+        seconds = [0.0] * len(calls)  # wall time of each call (derived latency, ospm/harness/latency.py)
         submission: str | None = None
+        failed = False  # a call failed: bash exited non-zero or timed out, another tool returned an error
         parallel = [(i, c) for i, c in enumerate(calls) if c.name in self.tools and self.tools[c.name].parallel]
         if len(parallel) > 1:
             with ThreadPoolExecutor(max_workers=min(4, len(parallel))) as pool:
-                futs = {i: pool.submit(self._run_tool, c) for i, c in parallel}
+                futs = {i: pool.submit(_timed, self._run_tool, c) for i, c in parallel}
                 for i, f in futs.items():
-                    results[i] = ToolResult(calls[i].id, f.result())
+                    out, seconds[i] = f.result()
+                    results[i] = ToolResult(calls[i].id, out)
         for i, c in enumerate(calls):
             if results[i] is not None:
                 continue
@@ -386,7 +445,8 @@ class Agent:
                 results[i] = ToolResult(c.id, f"Error: {c.error}", True)
             elif c.name == "bash":
                 cmd = str(c.arguments.get("command", ""))
-                res = self.env.execute(cmd, self.cfg.command_timeout)
+                res, seconds[i] = _timed(self.env.execute, cmd, self.cfg.command_timeout)
+                failed = failed or res.returncode != 0 or res.timed_out
                 sub = extract_submission(res.output)
                 if sub is not None:
                     problem = self.validate(sub) if self.validate else None
@@ -399,17 +459,20 @@ class Agent:
                 else:
                     results[i] = ToolResult(c.id, format_observation(res, self.cfg.observation_max_chars))
             elif c.name in self.tools:
-                results[i] = ToolResult(c.id, self._run_tool(c))
+                out, seconds[i] = _timed(self._run_tool, c)
+                results[i] = ToolResult(c.id, out)
             else:
                 results[i] = ToolResult(c.id, f"Error: unknown tool {c.name!r}", True)
         final = [r for r in results if r is not None]
-        self._record(turn, calls, final, "")
+        failed = failed or any(r.is_error for r in final)
+        self._record(turn, calls, final, "", seconds)
         if self.cfg.text_mode:
             self.conv.add_user("\n\n".join(r.output for r in final))
         else:
             self.conv.add_tool_results(final)
         if submission is not None:
             raise Submitted(submission)
+        self._track_stuck(calls, failed)
 
     def _run_tool(self, call: ToolCall) -> str:
         try:
@@ -417,11 +480,17 @@ class Agent:
         except Exception as e:  # a failing tool is reported to the model, not fatal
             return f"Error running {call.name}: {type(e).__name__}: {e}"
 
-    def _record(self, turn, calls, results, event) -> None:
+    def _record(self, turn, calls, results, event, seconds=()) -> None:
         self.trace.steps.append(Step(
             self.n_steps, turn.text, [{"name": c.name, "arguments": c.arguments, "id": c.id} for c in calls],
-            [{"id": r.call_id, "output": r.output[:20000], "is_error": r.is_error} for r in results],
+            [{"id": r.call_id, "output": r.output[:20000], "is_error": r.is_error,
+              **({"s": round(seconds[i], 3)} if i < len(seconds) else {})} for i, r in enumerate(results)],
             turn.input_tokens, turn.output_tokens, round(turn.cost, 6), time.time(), event))
+
+
+def _timed(fn: Callable[..., Any], *args: Any) -> tuple[Any, float]:
+    t0 = time.monotonic()
+    return fn(*args), time.monotonic() - t0
 
 
 def run_command(env: LocalEnvironment, command: str) -> ExecResult:  # convenience for tests/tools

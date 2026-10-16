@@ -35,8 +35,29 @@ THEMES = {
     "design": r"\bdesign\b|abstraction|refactor|instead of|why not|should (we|this|it)|move (this|it)|api",
     "naming_style": r"\bnaming\b|\brename\b|\bnit\b|style|readab|simplif|typo|unused",
 }
+# AI review text posted from maintainer accounts (SGLang: "[by Codex] **Severity: style | Confidence: High**"):
+# not a maintainer's own concern, so it is excluded from the ground truth (and from recurrence statistics)
+AI_TEXT = re.compile(r"\[by (claude|codex)|\*\*severity:|confidence: (high|medium|low)\b|codex review", re.I)
 TRIVIAL = re.compile(r"^\s*(lgtm|thanks?( you)?|nice|\+1|looks good|ok|done)\W*$", re.IGNORECASE)
 COMMENT_BUDGET = 3
+
+
+def is_ai_text(body: str | None) -> bool:
+    return bool(AI_TEXT.search(body or ""))
+
+
+def drop_ai_concerns(tasks: list[ReplayTask]) -> list[ReplayTask]:
+    """Remove AI-written comments from concern tasks' ground truth, in place-safe (splits are not recomputed).
+    A positive task left with no concern is dropped; every other task is returned untouched."""
+    out = []
+    for t in tasks:
+        if t.kind == "concern" and t.truth.get("positive"):
+            kept = [c for c in t.truth.get("concerns") or [] if not is_ai_text(c.get("body"))]
+            if not kept:
+                continue
+            t.truth["concerns"] = kept
+        out.append(t)
+    return out
 
 
 def themes_of(text: str) -> list[str]:
@@ -66,7 +87,10 @@ def concern_tasks(repo: ReplayRepo, include_negatives: bool = True) -> list[Repl
             inline = [c for c in inline if not TRIVIAL.match(c["body"] or "")]
             if not inline:
                 continue
-            any_inline = True
+            any_inline = True  # also when all of it is AI text: neither a positive nor a clean approval
+            inline = [c for c in inline if not is_ai_text(c["body"])]
+            if not inline:
+                continue
             task = _make(repo, pr, rv, inline, positive=True)
             if task:
                 out.append(task)
@@ -91,7 +115,7 @@ def _make(repo: ReplayRepo, pr: dict, rv: dict, inline: list[dict], positive: bo
     as_of = _minus(rv["submitted_at"])
     if repo.committed_after(sha, as_of):
         return None
-    base = repo.base_at(sha, as_of, pr["base_ref"] or "main")
+    base = repo.base_at(sha, as_of, pr["base_ref"] or repo.default_branch)
     if not base:
         return None
     concerns = [{"path": c["path"], "line": c["line"] or c["original_line"], "body": (c["body"] or "")[:600],

@@ -11,7 +11,7 @@ import copy
 import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from ..harness.env import SUBMIT_MARKER
@@ -49,8 +49,7 @@ specialist agents and are responsible for the final, combined decision on each r
 
 {project_context}
 
-## Your team (background agents; start them with `spawn_agent`)
-{team}
+## Coordinating your team (background agents; the types are listed at the end)
 `spawn_agent(role, prompt)` returns at once with an agent_id while the specialist works; spawn several to work in
 parallel and keep working yourself. `wait_for_agents(agent_ids, timeout_s)` blocks until notifications arrive and
 returns them (empty list = any of your agents). A `finished` notification carries the specialist's final message
@@ -79,6 +78,9 @@ specialist or none.
  "summary": "<2-4 sentences for the maintainers>"}
 Fill the part that matches the event kind (and any others you produced).
 {contracts}
+
+## Your team (agent types you can spawn)
+{team}
 {playbook}""",
 
     "triage": """You are the issue-triage specialist for the open-source project {project}.
@@ -174,12 +176,29 @@ CONTRACTS = {
     "security_contract": '{"findings": [{"type": "<weakness>", "path": "<file>", "line": <int>, "severity": '
                          '"critical|high|medium|low", "explanation": "<attack scenario and fix>"}], "summary": "<...>"}',
 }
+# contracts of the agent types beyond review (sdlc_library); kept apart so the seed prompts render unchanged
+SDLC_CONTRACTS = {
+    "plan_contract": '{"approach": "<the design in 2-5 sentences>", "files": ["<file to change>", ...], "steps": '
+                     '["<step>", ...], "risks": ["<risk or open question for the maintainers>", ...], '
+                     '"summary": "<...>"}',
+    "patch_contract": '{"status": "complete|partial|blocked", "files": ["<changed file>", ...], "tests_run": '
+                      '[{"command": "<ci-run ...>", "passed": true|false}], "summary": "<what changed and why; what is '
+                      'missing if not complete>"}',
+    "testcases_contract": '{"tests": [{"path": "<test file>", "name": "<test name>", "purpose": "<behaviour it pins '
+                          'down>"}], "fails_before": true|false|null, "passes_after": true|false|null, '
+                          '"summary": "<...>"}',
+    "release_contract": '{"bump": "major|minor|patch|none", "highlights": ["<user-facing change (#PR)>", ...], '
+                        '"breaking": ["<breaking change and how to migrate>", ...], "notes": "<release notes in '
+                        'markdown>", "summary": "<...>"}',
+}
 
 ENUMS = {
     "kind": {"bug", "feature", "docs", "question", "other"},
     "decision": {"accept", "needs-info", "duplicate", "invalid", "declined"},
     "category": {"test_failure", "lint", "type_check", "build", "docs", "dependency", "timeout", "infra"},
     "verdict": {"approve", "comment", "request_changes"},
+    "status": {"complete", "partial", "blocked"},
+    "bump": {"major", "minor", "patch", "none"},
 }
 
 
@@ -255,20 +274,69 @@ def validate_notes(d: dict) -> str | None:
     return None
 
 
+def _str_lists(d: dict, *keys: str) -> str | None:
+    for k in keys:
+        if not isinstance(d.get(k), list) or not all(isinstance(x, str) for x in d[k]):
+            return f"'{k}' must be a list of strings"
+    return None
+
+
+def validate_plan(d: dict) -> str | None:
+    if not isinstance(d.get("approach"), str) or not d["approach"].strip():
+        return "'approach' must be a non-empty string"
+    return _str_lists(d, "files", "steps", "risks")
+
+
+def validate_patch(d: dict) -> str | None:
+    if (e := _check_enum(d, "status")) or (e := _str_lists(d, "files")):
+        return e
+    if d["status"] == "complete" and not d["files"]:
+        return "a complete patch must list the files it changed"
+    for t in d.get("tests_run", []):
+        if not isinstance(t, dict) or not isinstance(t.get("command"), str) or not isinstance(t.get("passed"), bool):
+            return "each entry of 'tests_run' needs a string 'command' and a boolean 'passed'"
+    return None
+
+
+def validate_testcases(d: dict) -> str | None:
+    if not isinstance(d.get("tests"), list):
+        return "'tests' must be a list"
+    for t in d["tests"]:
+        if not isinstance(t, dict) or not isinstance(t.get("path"), str) or not isinstance(t.get("name"), str):
+            return "each test needs a string 'path' and a string 'name'"
+    for k in ("fails_before", "passes_after"):
+        if d.get(k) is not None and not isinstance(d[k], bool):
+            return f"'{k}' must be true, false or null"
+    return None
+
+
+def validate_release(d: dict) -> str | None:
+    if (e := _check_enum(d, "bump")) or (e := _str_lists(d, "highlights", "breaking")):
+        return e
+    if not isinstance(d.get("notes"), str):
+        return "'notes' must be a string"
+    return None
+
+
 CONTRACT_VALIDATORS = {"triage": validate_triage, "ci": validate_ci, "review": validate_review,
-                       "security": validate_security, "notes": validate_notes}
+                       "security": validate_security, "notes": validate_notes, "plan": validate_plan,
+                       "patch": validate_patch, "testcases": validate_testcases, "release": validate_release}
 BUILTIN_CONTRACTS = {"triage": "triage", "ci_triage": "ci", "review": "review", "security": "security"}
 SECTION_VALIDATORS = {r: CONTRACT_VALIDATORS[c] for r, c in BUILTIN_CONTRACTS.items()}
 
 
+EVENT_PARTS = {"issue": "triage", "pull_request": "review", "ci_failure": "ci", "implementation": "patch",
+               "release": "release"}  # event kind -> the output part it requires
+
+
 def validate_orchestrator(d: dict) -> str | None:
-    if d.get("event_kind") not in ("issue", "pull_request", "ci_failure"):
-        return "'event_kind' must be issue, pull_request or ci_failure"
-    need = {"issue": "triage", "pull_request": "review", "ci_failure": "ci"}[d["event_kind"]]
+    if d.get("event_kind") not in EVENT_PARTS:
+        return f"'event_kind' must be one of {', '.join(EVENT_PARTS)}"
+    need = EVENT_PARTS[d["event_kind"]]
     if not d.get(need):
         return f"'{need}' is required for a {d['event_kind']} event"
-    for key, fn in (("triage", validate_triage), ("review", validate_review), ("security", validate_security)):
-        if d.get(key) and (e := fn(d[key])):
+    for key in ("triage", "review", "security", "plan", "patch", "testcases", "release"):
+        if d.get(key) and (e := CONTRACT_VALIDATORS[key](d[key])):
             return f"{key}: {e}"
     for c in d.get("ci") or []:
         if (e := validate_ci(c)):
@@ -325,12 +393,18 @@ class TeamGenome:
     parents: list[str] = field(default_factory=list)
     origin: str = "seed"
     notes: str = ""
+    board: bool = False  # a shared notes board for every agent of an episode (ospm/team/runner.py)
+    task_board: bool = False  # a shared task board: owners, dependencies, advisory write scopes (runner.py)
 
     @property
     def id(self) -> str:
         blob = json.dumps({r: g.content_hash() for r, g in sorted(self.roles.items())})
         if descs := {r: g.description for r, g in sorted(self.roles.items()) if g.description}:
             blob += json.dumps(descs)
+        if self.board:
+            blob += "|board"
+        if self.task_board:
+            blob += "|tasks"
         return hashlib.sha256(blob.encode()).hexdigest()[:12]
 
     def specialists(self) -> list[str]:
@@ -348,12 +422,14 @@ class TeamGenome:
 
     def to_dict(self) -> dict[str, Any]:
         return {"id": self.id, "parents": self.parents, "origin": self.origin, "notes": self.notes,
+                "board": self.board, "task_board": self.task_board,
                 "roles": {r: asdict(g) for r, g in self.roles.items()}}
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "TeamGenome":
         return cls({r: RoleGenome(**g) for r, g in d["roles"].items()}, list(d.get("parents", [])),
-                   d.get("origin", "seed"), d.get("notes", ""))
+                   d.get("origin", "seed"), d.get("notes", ""), bool(d.get("board", False)),
+                   bool(d.get("task_board", False)))
 
 
 def seed_team() -> TeamGenome:
@@ -427,17 +503,96 @@ def seed_library() -> TeamGenome:
     return team
 
 
+_SHARED_CHECKOUT = (" Teammates may work in the same checkout: never run `git stash`, `git checkout`, `git reset` "
+                    "or `git clean`, and never commit or push.")
+
+# the orchestrator of sdlc_library: the seed prompt plus implementation and release events
+_SDLC_EDITS = (
+    ('"event_kind": "issue" | "pull_request" | "ci_failure",',
+     '"event_kind": "issue" | "pull_request" | "ci_failure" | "implementation" | "release",'),
+    ('"security": <security contract or null>,',
+     '"security": <security contract or null>,\n "plan": <plan contract or null>, "patch": <patch contract or null>, '
+     '"testcases": <testcases contract or null>, "release": <release contract or null>,'),
+    ("{contracts}\n", "{contracts}\n{sdlc_contracts}\n"),
+    ("small events need one\nspecialist or none.",
+     "small events need one\nspecialist or none. For an implementation event the change in the shared checkout is "
+     "the deliverable:\nplan it, implement it, cover it with tests and have it reviewed before you submit; give "
+     "writers disjoint files."),
+)
+
+
+def _sdlc_orchestrator() -> str:
+    text = DEFAULT_SYSTEM["orchestrator"]
+    for old, new in _SDLC_EDITS:
+        assert text.count(old) == 1, old
+        text = text.replace(old, new)
+    return text
+
+
+def sdlc_library() -> TeamGenome:
+    """seed_library() plus agent types for the rest of the maintainer workflow: planning, implementing, testing and
+    releasing. The orchestrator also accepts `implementation` and `release` events."""
+    team = seed_library()
+    team.roles["orchestrator"] = replace(team.roles["orchestrator"], system_template=_sdlc_orchestrator())
+    for g in (
+        specialist(
+            "planner",
+            "You are a planner, not an implementer. For an issue or a requested change, work out how to implement it "
+            "in this codebase: find where the behaviour lives (`grep`, `git log`, `hist search` / `hist issue` for "
+            "related discussions and earlier attempts), choose an approach consistent with the project's design, and "
+            "list the files to change, the steps, and the risks or open questions for the maintainers. Do not modify "
+            "files.",
+            contract="plan",
+            description="Designs how to implement an issue or change: where the code lives, the approach, files, "
+                        "steps and risks. Does not modify files."),
+        specialist(
+            "implementer",
+            "You implement changes. Given an issue to fix, a change to make or review feedback on an earlier patch, "
+            "make the change in your checkout: read the relevant code and its tests first, make the smallest change "
+            "that fully solves the task in the project's conventions, and run the most relevant tests with `ci-run`. "
+            "You may modify tracked files, but only the ones your brief assigns to you. If you cannot finish, leave "
+            "the code consistent and say what is missing (status partial or blocked)." + _SHARED_CHECKOUT,
+            contract="patch",
+            description="Writes the code change for an issue, a planned change or review feedback, and runs the "
+                        "relevant tests."),
+        specialist(
+            "test_writer",
+            "You write tests. For the behaviour in your brief (a bug to reproduce or a change to cover), add focused "
+            "tests next to the existing tests of that code, in the project's test style, including the edge cases "
+            "that matter. Run them with `ci-run`; report whether they fail without the change (fails_before; null if "
+            "you could not check) and pass with it (passes_after). Modify test files only." + _SHARED_CHECKOUT,
+            contract="testcases",
+            description="Adds tests that reproduce a bug or cover a change, and checks they fail before and pass "
+                        "after."),
+        specialist(
+            "release",
+            "You prepare a release. From the pull requests merged since the last release (`hist recent --days D`, "
+            "`git log --since`, `hist pr N`), choose the version bump (breaking change: major, new feature: minor, "
+            "fixes only: patch), pick the user-facing highlights, list breaking changes with how to migrate, and "
+            "write the release notes in the style of the project's earlier changelog entries. Do not modify files.",
+            contract="release",
+            description="Drafts a release: version bump, highlights, breaking changes and release notes from the "
+                        "merged pull requests."),
+    ):
+        team.roles[g.role] = g
+    return team
+
+
 def team_listing(team: TeamGenome) -> str:
     return "\n".join(f"- {r}: {team.roles[r].description or DEFAULT_DESCRIPTIONS.get(r, '(no description)')}"
                      for r in team.specialists())
 
 
 def render_system(genome: RoleGenome, project: str, project_context: str, team: str = "") -> str:
-    """Fill the static parts of a role's system prompt (the per-event parts go in the instance message)."""
+    """Fill the static parts of a role's system prompt (the per-event parts go in the instance message).
+
+    Templates put what evolution changes (the team listing, the playbook) last, so an edit keeps the cached prefix."""
     out = genome.system_template
     for key, val in {"project": project, "project_context": project_context, "tools": COMMON_TOOLS, "team": team,
                      "playbook": genome.render_playbook(), "contracts": "\n".join(
                          f"- {k.replace('_contract', '')}: {v}" for k, v in CONTRACTS.items()),
-                     **CONTRACTS}.items():
+                     "sdlc_contracts": "\n".join(f"- {k.replace('_contract', '')}: {v}"
+                                                   for k, v in SDLC_CONTRACTS.items()),
+                     **CONTRACTS, **SDLC_CONTRACTS}.items():
         out = out.replace("{" + key + "}", val)
     return out

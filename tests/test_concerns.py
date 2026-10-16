@@ -10,6 +10,8 @@ from ospm.replay.concerns import (
     chronological_split,
     concern_metrics,
     concern_tasks,
+    drop_ai_concerns,
+    is_ai_text,
     is_nit,
     score_concerns,
     themes_of,
@@ -66,10 +68,12 @@ def data(tmp_path_factory):
         {**item, "number": 3, "title": "PR C", "author": "dependabot[bot]", "created_at": "2026-05-04T13:00:00Z"},
         {**item, "number": 4, "title": "PR D", "author": "carol", "created_at": "2026-05-04T14:00:00Z"},
         {**item, "number": 5, "title": "PR E", "author": "carol", "created_at": "2026-05-04T15:00:00Z"},
+        {**item, "number": 6, "title": "PR F", "author": "carol", "created_at": "2026-05-04T16:00:00Z"},
+        {**item, "number": 7, "title": "PR G", "author": "carol", "created_at": "2026-05-04T17:00:00Z"},
     ])
     s.upsert("pulls", [{"number": n, "head_sha": f1, "head_ref": "feature", "head_repo": "carol/x", "base_ref": "main",
-                        "base_sha": c1, "merged_at": "2026-06-02T10:00:00Z" if n in (1, 2, 5) else None,
-                        "merge_commit_sha": None, "draft": 0, "have_head": 1} for n in (1, 2, 3, 4, 5)])
+                        "base_sha": c1, "merged_at": "2026-06-02T10:00:00Z" if n in (1, 2, 5, 6) else None,
+                        "merge_commit_sha": None, "draft": 0, "have_head": 1} for n in (1, 2, 3, 4, 5, 6, 7)])
 
     def review(id_, number, author, assoc, state, at, sha):
         return {"id": id_, "number": number, "author": author, "author_association": assoc, "state": state,
@@ -82,6 +86,8 @@ def data(tmp_path_factory):
         review(30, 3, "maint", "MEMBER", "CHANGES_REQUESTED", "2026-05-07T10:00:00Z", f1),
         review(40, 4, "rando", "NONE", "CHANGES_REQUESTED", "2026-05-07T11:00:00Z", f1),
         # GitHub reports this approval against f2, a commit made a day *after* the approval: not reviewable then
+        review(60, 6, "maint", "MEMBER", "APPROVED", "2026-05-07T12:00:00Z", f1),
+        review(70, 7, "maint", "MEMBER", "CHANGES_REQUESTED", "2026-05-07T13:00:00Z", f1),
         review(50, 5, "maint", "MEMBER", "APPROVED", "2026-05-04T12:00:00Z", f2),
     ])
 
@@ -96,6 +102,10 @@ def data(tmp_path_factory):
         rc(102, 1, 10, "carol", "NONE", 32, "good point, will fix", reply=101),
         rc(103, 1, 10, "maint", "MEMBER", 10, "LGTM"),
         rc(300, 3, 30, "maint", "MEMBER", 32, "this crashes when the list is empty"),
+        rc(600, 6, 60, "maint", "MEMBER", 32, "[by Codex] **Severity: style | Confidence: High** rename this"),
+        rc(601, 6, 60, "maint", "MEMBER", 5, "**Severity: bug | Confidence: Medium** unchecked index"),
+        rc(700, 7, 70, "maint", "MEMBER", 5, "[by Claude] **Severity: nit | Confidence: Low** tidy"),
+        rc(701, 7, 70, "maint", "MEMBER", 32, "please also cover the empty list"),
         rc(400, 4, 40, "rando", "NONE", 32, "this crashes when the list is empty"),
     ])
     s.close()
@@ -109,7 +119,8 @@ def tasks(data):
 
 def test_mining(data, tasks):
     # nothing for the bot PR (3), the NONE reviewer (4) or the approval reported against a later commit (5)
-    assert sorted(tasks) == ["concern-neg:2", "concern:1"]
+    # PR 6 was reviewed only with AI-written comments: neither a positive task nor a clean approval
+    assert sorted(tasks) == ["concern-neg:2", "concern:1", "concern:7"]
     pos, neg = tasks["concern:1"], tasks["concern-neg:2"]
     assert pos.id == f"concern:1@{data['f1'][:8]}:10" and neg.id == f"concern-neg:2@{data['f1'][:8]}"
     assert pos.kind == "concern" and pos.pr == 1 and pos.sha == data["f1"]
@@ -120,6 +131,21 @@ def test_mining(data, tasks):
     assert "correctness" in cs[1]["themes"] and cs[1]["line"] == 32 and cs[1]["path"] == PATH
     assert pos.as_of == "2026-05-06T08:59:59Z" and pos.meta["base"] == data["c1"]
     assert neg.as_of == "2026-05-07T08:59:59Z"
+
+
+def test_ai_text_is_dropped_from_ground_truth(tasks):
+    assert "concern:6" not in tasks and "concern-neg:6" not in tasks
+    assert [c["body"] for c in tasks["concern:7"].truth["concerns"]] == ["please also cover the empty list"]
+
+
+def test_drop_ai_concerns_in_place():
+    ai = {"path": "a", "line": 1, "body": "[by Codex] **Severity: style | Confidence: High** x", "themes": [], "nit": False}
+    human = {"path": "a", "line": 2, "body": "why not use a set here?", "themes": [], "nit": False}
+    mk = lambda i, cs, pos=True: ReplayTask(i, "concern", "2026-05-01T00:00:00Z", "s", "e",  # noqa: E731
+                                            {"positive": pos, "concerns": cs}, split="test")
+    out = drop_ai_concerns([mk("a", [ai]), mk("b", [ai, human]), mk("c", [], pos=False)])
+    assert [t.id for t in out] == ["b", "c"] and out[0].truth["concerns"] == [human] and out[0].split == "test"
+    assert is_ai_text("[by Claude] x") and not is_ai_text("add a test please")
 
 
 def test_helpers():

@@ -62,7 +62,7 @@ def test_credit_attributes_findings_cost_and_clean_pr_comments(tmp_path):
           "children": [child("review", [race]), child("security", [], cost=0.004, steps=7)]}
     cr = episode_credit(tr, task("t1", 1, True, "2026-01-01"), m)
     assert cr["agents"][0]["found"] == [0] and cr["agents"][1]["found"] == []
-    assert cr["orchestrator"] == {"cost": 0.02, "bash_steps": 1, "coordination": {"spawn_agent": 2}}
+    assert cr["orchestrator"] == {"cost": 0.02, "latency_s": 1.0, "bash_steps": 1, "coordination": {"spawn_agent": 2}}
     tr_clean = {"cost": 0.01, "steps": [], "children": [child("review", [race]), child("security", [])]}
     table = credit_table([(task("t1", 1, True, "2026-01-01"), cr),
                           (task("t2", 2, False, "2026-01-02"), episode_credit(tr_clean, task("t2", 2, False, "x"), m))])
@@ -71,17 +71,22 @@ def test_credit_attributes_findings_cost_and_clean_pr_comments(tmp_path):
     assert table["security"]["spawned"] == 2 and table["security"]["mean_steps"] == 6
 
 
-def evolver(tmp_path, quality, cost, edits):
-    """quality(genome, task) and cost(genome) drive a fake runner; the reflector proposes `edits` once."""
+def evolver(tmp_path, quality, cost, edits, latency=lambda g: 10.0):
+    """quality(genome, task), cost(genome) and latency(genome) (seconds of one timed tool call) drive a fake runner;
+    the reflector proposes `edits` once."""
     seen = []
 
     def run(t, ctx="", skills=(), role_ctx=(), genome=None):
         seen.append((t.id, genome.id))
         return quality(genome, t), {"comments": []}
 
+    def trace_of(t, ctx="", skills=(), role_ctx=(), genome=None):
+        step = {"n": 1, "input_tokens": 0, "output_tokens": 0, "calls": [{"name": "bash", "id": "c"}],
+                "results": [{"id": "c", "output": "", "s": latency(genome)}]}
+        return {"cost": cost(genome), "steps": [step], "children": []}
+
     run.cost_of = lambda t, ctx="", skills=(), role_ctx=(), genome=None: cost(genome)
-    run.trace_of = lambda t, ctx="", skills=(), role_ctx=(), genome=None: {"cost": cost(genome), "steps": [],
-                                                                           "children": []}
+    run.trace_of = trace_of
     it = iter([edits])
     past = [task(f"p{i}", 100 + i, True, f"2026-01-0{i + 1}") for i in range(4)] + \
            [task(f"n{i}", 200 + i, False, f"2026-01-0{i + 1}") for i in range(4)]
@@ -126,3 +131,25 @@ def test_validation_uses_other_known_prs_never_the_source(tmp_path):
     val = evo.edits[0]["validation"]["tasks"]
     assert "p0" not in val and len([v for v in val if v.startswith(("p", "tr1"))]) == 3
     assert all(v in {t for t, _ in seen} for v in val)
+
+
+def test_the_team_board_is_a_team_level_edit():
+    g = seed_library()
+    on = apply_edit(g, edit("set_board", "orchestrator", "on"))
+    assert on.board and not g.board and on.id != g.id and level_of(edit("set_board", "orchestrator")) == "team"
+    assert apply_edit(on, edit("set_board", "orchestrator", "on")) is None  # no-op
+    assert not apply_edit(on, edit("set_board", "orchestrator", "off")).board
+
+
+def test_latency_is_an_objective(tmp_path):
+    rule = edit("add_rule", "orchestrator", "Spawn independent specialists together, then wait once.")
+    ruled = lambda g: bool(g.roles["orchestrator"].playbook)  # noqa: E731
+    evo, _ = evolver(tmp_path, lambda g, t: 0.5, lambda g: 0.02, [rule], latency=lambda g: 60.0 if ruled(g) else 100.0)
+    evo.learn(TRAIN)
+    v = evo.edits[0]["validation"]
+    assert evo.edits[0]["status"] == "adopted" and v["accepted_for"] == "latency" and v["latency_ratio"] == 0.6
+    # a quality gain that makes the episodes twice as slow is rejected
+    evo, _ = evolver(tmp_path, lambda g, t: 0.8 if ruled(g) else 0.5, lambda g: 0.02, [rule],
+                     latency=lambda g: 200.0 if ruled(g) else 100.0)
+    evo.learn(TRAIN)
+    assert evo.edits[0]["status"] == "rejected" and evo.edits[0]["validation"]["accepted_for"] is None

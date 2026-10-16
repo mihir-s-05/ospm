@@ -222,12 +222,42 @@ def test_workspace_cannot_see_future_commits(data):
         assert "fix #10 (future)" not in log and "merge feature" not in log and "add new()" in log
         main = subprocess.run(["git", "rev-parse", "main"], cwd=ws, capture_output=True, text=True).stdout.strip()
         assert main == data["c1"]
+        future = subprocess.run(["git", "--git-dir", str(repo.git_dir), "rev-parse", "HEAD"], capture_output=True,
+                                text=True).stdout.strip()
+        logs = "".join(f.read_text() for f in (ws / ".git").rglob("logs/**/*") if f.is_file())
+        assert future not in logs and future not in (ws / ".git" / "packed-refs").read_text()  # no future tip
         assert (ws / "src" / "_pytest" / "_version.py").exists()
         env = repo.environment(ws, "2026-05-05T00:00:00Z", pr=12, pr_sha=data["pr_sha"], base=data["c1"])
         assert "add new()" in env.execute("hist pr 12").output
         env.cleanup()
     assert not ws.exists()
     assert repo.base_at(data["pr_sha"], "2026-05-05T00:00:00Z") == data["c1"]
+
+
+def test_a_pooled_workspace_is_reset_completely_before_reuse(data):
+    """Reuse saves a full checkout, but nothing an earlier agent did may survive: files, commits, refs, reflogs."""
+    repo = ReplayRepo(data["dir"])
+    repo.pool_size = 1
+    git = lambda ws, *a: subprocess.run(["git", *a], cwd=ws, capture_output=True, text=True).stdout  # noqa: E731
+    with repo.worktree(data["pr_sha"], "2026-05-05T00:00:00Z") as first:
+        (first / "src" / "_pytest" / "fixtures.py").write_text("edited", encoding="utf-8")
+        (first / "notes.txt").write_text("scratch", encoding="utf-8")
+        (first / "build").mkdir()
+        (first / ".gitignore").write_text("build/" + chr(10), encoding="utf-8")
+        (first / "build" / "out.o").write_text("x", encoding="utf-8")
+        git(first, "-c", "user.name=a", "-c", "user.email=a@b", "commit", "-qam", "agent commit")
+        git(first, "tag", "agent-tag")
+    assert first.exists() and repo._pool == [first]
+    with repo.worktree(data["c1"], "2026-05-05T00:00:00Z") as second:
+        assert second == first and not repo._pool
+        assert not (second / "notes.txt").exists() and not (second / "build").exists()
+        assert git(second, "status", "--porcelain").split() == ["??", "src/_pytest/_version.py"]  # written on purpose
+        assert git(second, "rev-parse", "HEAD").strip() == data["c1"]
+        assert "agent commit" not in git(second, "log", "--all", "--format=%s")
+        assert "agent commit" not in git(second, "reflog") and data["pr_sha"][:7] not in git(second, "reflog")
+        assert git(second, "for-each-ref", "--format=%(refname)").split() == ["refs/heads/main"]
+    repo.close()
+    assert not first.exists()
 
 
 def test_workspace_keeps_no_refs_but_main_even_with_tags_and_symrefs(data):

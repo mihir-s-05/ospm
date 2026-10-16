@@ -75,9 +75,11 @@ def trim_log(text: str) -> str:
     return text[:LOG_HEAD] + f"\n... [{len(text) - LOG_HEAD - LOG_TAIL} characters trimmed by ospm] ...\n" + text[-LOG_TAIL:]
 
 
-# bot accounts without the "[bot]" suffix (PyTorch's land and sync bots are ordinary user accounts)
+# bot accounts without the "[bot]" suffix (PyTorch's land and sync bots, Rust's merge queue and triage bots are
+# ordinary user accounts)
 BOT_LOGINS = {"copilot", "pre-commit-ci", "github-actions", "dependabot", "pytorchmergebot", "pytorchbot",
-              "pytorch-bot", "facebook-github-bot"}
+              "pytorch-bot", "facebook-github-bot", "bors", "rustbot", "rust-timer", "rust-log-analyzer",
+              "rust-highfive", "rfcbot"}
 
 
 def is_bot(login: str | None) -> bool:

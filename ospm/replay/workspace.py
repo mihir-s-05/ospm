@@ -1,7 +1,8 @@
 """Replay workspaces: git worktrees at historical commits, sandbox helper commands, and local CI.
 
-Storage-conscious by design: worktrees are created per episode from the bare mirror and removed afterwards;
-one shared virtualenv (the project's runtime dependencies only) serves every local CI run.
+Storage-conscious by design: worktrees are created per episode from the bare mirror and removed afterwards (or,
+with `pool_size`, reset and reused: a fresh checkout of a 28k-file repository takes minutes on Windows); one
+shared virtualenv (the project's runtime dependencies only) serves every local CI run.
 """
 
 from __future__ import annotations
@@ -87,6 +88,26 @@ echo "available skills: $(ls "$d" 2>/dev/null | sed -n 's/\.md$//p' | tr '\n' ' 
 exit 1
 '''
 
+# grep -r/-R through `git grep` (ospm/harness/fastgrep.py: minutes -> seconds on large Windows checkouts); anything
+# else, or anything it cannot translate (exit 254), is the real grep
+GREP_SCRIPT = r'''#!/usr/bin/env bash
+rec=0
+for a in "$@"; do
+  case $a in
+    --) break ;;
+    --recursive|--dereference-recursive) rec=1 ;;
+    --*) ;;
+    -*[rR]*) rec=1 ;;
+  esac
+done
+if [ $rec = 1 ]; then
+  PYTHONPATH="{root}" "{py}" -m ospm.harness.fastgrep "$@"
+  rc=$?
+  [ $rc -ne 254 ] && exit $rc
+fi
+command -p grep "$@"
+'''
+
 
 def write_skills(bin_dir: Path, skills) -> None:
     """`skill` command: no args lists the skills, `skill <name>` prints one (a header line + the body)."""
@@ -108,12 +129,24 @@ class ReplayRepo:
         self.wt_root = self.data / "wt"
         self.venv = self.data / "venv"
         self._lock = threading.Lock()
+        # checked-out trees kept for reuse (0 = remove each after its episode); see worktree()
+        self.pool_size = 0
+        self._pool: list[Path] = []
         if not self.git_dir.exists() or not self.db_path.exists():
             raise FileNotFoundError(f"{self.data} is not a mirror (run `ospm mirror` first)")
         self.store = HistoryStore(self.db_path, readonly=True)
 
     # ------------------------------------------------------------------ commits
-    def commit_before(self, ts: str, branch: str = "main") -> str:
+    @property
+    def default_branch(self) -> str:
+        """The repository's default branch (the bare clone's HEAD), e.g. `dev` for Home Assistant."""
+        if not hasattr(self, "_default_branch"):
+            ref = _git(self.git_dir, "symbolic-ref", "--quiet", "HEAD", check=False)
+            self._default_branch = ref.removeprefix("refs/heads/") or "main"
+        return self._default_branch
+
+    def commit_before(self, ts: str, branch: str | None = None) -> str:
+        branch = branch or self.default_branch
         # --first-parent: a PR merged later carries commits with *earlier* dates; only the branch's own
         # first-parent chain says what was actually on the branch at `ts`
         sha = _git(self.git_dir, "rev-list", "-1", "--first-parent", f"--before={ts}", f"refs/heads/{branch}")
@@ -139,8 +172,9 @@ class ReplayRepo:
     def merge_base(self, a: str, b: str) -> str:
         return _git(self.git_dir, "merge-base", a, b, check=False)
 
-    def base_at(self, sha: str, as_of: str, branch: str = "main") -> str:
+    def base_at(self, sha: str, as_of: str, branch: str | None = None) -> str:
         """Fork point of a PR commit from the target branch *as it was* at `as_of` (later merges excluded)."""
+        branch = branch or self.default_branch
         if is_ghstack(branch):  # synthetic per-PR base branch, long deleted: read the base off the commits
             return ghstack_base(lambda *a: _git(self.git_dir, *a, check=False), sha)
         try:
@@ -159,49 +193,54 @@ class ReplayRepo:
             self.promisor_url = _git(self.git_dir, "config", "--get", "remote.origin.url", check=False)
         return self._partial
 
-    def _missing(self, commit: str) -> int:
-        """Number of objects of `commit`'s tree not present locally (no network access)."""
+    def _missing(self, commit: str) -> list[str]:
+        """Objects of `commit`'s tree not present locally (no network access)."""
         out = subprocess.run(["git", "--git-dir", str(self.git_dir), "rev-list", "--objects", "--no-walk",
                               "--missing=print", commit], capture_output=True, text=True, encoding="utf-8",
                              errors="replace", env=_NO_LAZY).stdout
-        return sum(1 for line in out.splitlines() if line.startswith("?"))
+        return [line[1:].split()[0] for line in out.splitlines() if line.startswith("?")]
 
     def prefetch(self, sha: str, base: str = "") -> None:
         """Batch-fetch the blobs of `sha`'s tree (and of the files changed since `base`) into the mirror once, so
         workspaces cloned with --shared can check them out and later replays need no network."""
-        if not any(self._missing(c) for c in (sha, base) if c):
-            return  # everything already cached in the mirror
-        scratch = self.wt_root / f"prefetch-{uuid.uuid4().hex[:8]}"
-        index = scratch.with_suffix(".index")
-        try:
-            env = dict(os.environ, GIT_INDEX_FILE=str(index))
-            scratch.mkdir(parents=True, exist_ok=True)
-            subprocess.run(["git", "--git-dir", str(self.git_dir), "--work-tree", str(scratch), "read-tree",
-                            "--reset", "-u", sha], env=env, capture_output=True, check=False)
-            if base:
-                subprocess.run(["git", "--git-dir", str(self.git_dir), "diff", "--stat", f"{base}..{sha}"],
-                               capture_output=True, check=False)
-        finally:
-            _rmtree(scratch)
-            index.unlink(missing_ok=True)
+        missing = self._missing(sha)
+        if missing:  # by id, as git's own lazy fetch does: no scratch checkout of the whole tree
+            subprocess.run(["git", "--git-dir", str(self.git_dir), "-c", "fetch.negotiationAlgorithm=noop", "fetch",
+                            "origin", "--no-tags", "--no-write-fetch-head", "--recurse-submodules=no",
+                            "--filter=blob:none", "--stdin"], input="".join(f"{o}\n" for o in missing).encode(),
+                           capture_output=True, check=False)
+        if base and (missing or self._missing(base)):
+            subprocess.run(["git", "--git-dir", str(self.git_dir), "diff", "--stat", f"{base}..{sha}"],
+                           capture_output=True, check=False)
 
     @contextlib.contextmanager
-    def worktree(self, sha: str, as_of: str | None = None, branch: str = "main", base: str = "") -> Iterator[Path]:
+    def worktree(self, sha: str, as_of: str | None = None, branch: str | None = None, base: str = "") -> Iterator[Path]:
         """A checkout of `sha` that cannot see the future.
 
         A `git clone --shared` (objects via alternates: no extra object storage) whose only refs are the detached
-        HEAD and `main` as it was at `as_of`. Later commits stay unnamed, so `git log main` shows exactly the
-        history that existed at the event time.
+        HEAD and the default branch as it was at `as_of`. Later commits stay unnamed, so `git log main` shows
+        exactly the history that existed at the event time.
         """
-        path = self.wt_root / uuid.uuid4().hex[:10]
+        branch = branch or self.default_branch
+        with self._lock:
+            reused = self._pool.pop() if self._pool else None
+        path = reused or self.wt_root / uuid.uuid4().hex[:10]
         self.wt_root.mkdir(parents=True, exist_ok=True)
+        ok = False
         try:
             if self.partial:
                 self.prefetch(sha, base)
-            subprocess.run(["git", "clone", "--quiet", "--shared", "--no-checkout", str(self.git_dir.resolve()),
-                            str(path)], check=True, capture_output=True)
             g = path / ".git"
-            _git(g, "--work-tree", str(path), "checkout", "--quiet", "--detach", sha, lazy=True)
+            if reused:
+                try:
+                    self._reset(path, sha)
+                except (OSError, RuntimeError, subprocess.CalledProcessError):
+                    _rmtree(path)  # e.g. an index entry the earlier agent staged: start from scratch
+                    reused = None
+            if not reused:
+                subprocess.run(["git", "clone", "--quiet", "--shared", "--no-checkout", str(self.git_dir.resolve()),
+                                str(path)], check=True, capture_output=True)
+                _git(g, "--work-tree", str(path), "checkout", "--quiet", "--detach", sha, lazy=True)
             # one transaction: a mirror can hold tens of thousands of refs (PyTorch: ~17k branches and PR heads),
             # and one `update-ref -d` process per ref takes many minutes on Windows
             for line in _git(g, "for-each-ref", "--format=%(refname) %(symref)").splitlines():
@@ -215,6 +254,7 @@ class ReplayRepo:
                     f"delete {r}\n" for r in refs).encode(), capture_output=True, env=_NO_LAZY, check=False)
             for ref in _git(g, "for-each-ref", "--format=%(refname)").split():  # whatever the batch left
                 _git(g, "update-ref", "-d", ref, check=False)
+            _rmtree(g / "logs")  # the clone's HEAD reflog names the mirror's current (future) default-branch tip
             _git(g, "remote", "remove", "origin", check=False)
             if self.partial and self.promisor_url:
                 # older blobs an agent touches (git show/log -p) are fetched on demand by hash; explicit
@@ -231,9 +271,38 @@ class ReplayRepo:
             if vf.parent.exists() and not vf.exists():
                 vf.write_text(VERSION_FILE, encoding="utf-8")  # normally generated by setuptools-scm
             yield path
+            ok = True
         finally:
-            _rmtree(path)
             _rmtree(path.parent / f"{path.name}-bin")
+            with self._lock:
+                keep = ok and len(self._pool) < self.pool_size
+                if keep:
+                    self._pool.append(path)
+            if not keep:
+                _rmtree(path)
+
+    def _reset(self, path: Path, sha: str) -> None:
+        """Give a pooled tree a brand-new .git (no refs, reflogs, objects, config or hooks of the earlier episode)
+        and check out `sha`. Its index comes along, so only the files that differ are rewritten."""
+        g, fresh = path / ".git", self.wt_root / uuid.uuid4().hex[:10]
+        try:
+            subprocess.run(["git", "clone", "--quiet", "--shared", "--no-checkout", str(self.git_dir.resolve()),
+                            str(fresh)], check=True, capture_output=True)
+            shutil.move(str(g / "index"), str(fresh / ".git" / "index"))
+            _rmtree(g)
+            shutil.move(str(fresh / ".git"), str(g))
+        finally:
+            _rmtree(fresh)
+        _git(g, "--work-tree", str(path), "checkout", "--quiet", "--force", "--detach", sha, lazy=True)
+        subprocess.run(["git", "--git-dir", str(g), "--work-tree", str(path), "clean", "-ffdxq"], cwd=path,
+                       check=True, capture_output=True, env=_NO_LAZY)
+
+    def close(self) -> None:
+        """Remove the pooled trees."""
+        with self._lock:
+            pool, self._pool = self._pool, []
+        for path in pool:
+            _rmtree(path)
 
     def clean(self) -> None:
         _rmtree(self.wt_root)
@@ -267,6 +336,8 @@ class ReplayRepo:
                  '-m pytest -p no:cacheprovider -q --no-header -x "$@"\n' if venv_py else
                  'echo "local CI is not set up (run: ospm replay setup-ci)"; exit 2\n'))
         (bin_dir / "ci-run").write_text(ci, encoding="utf-8", newline="\n")
+        (bin_dir / "grep").write_text(GREP_SCRIPT.format(root=_posix(PROJECT_ROOT), py=py), encoding="utf-8",
+                                      newline="\n")
 
     def environment(self, workspace: Path, as_of: str, *, pr: int | None = None, pr_sha: str = "",
                     sha: str = "", base: str = "", timeout: int = 180, skills=()) -> LocalEnvironment:

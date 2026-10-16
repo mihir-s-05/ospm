@@ -48,6 +48,12 @@ def find_bash() -> str:
     raise RuntimeError("bash not found (install Git for Windows or set OSPM_BASH)")
 
 
+def _msys_path(p: str) -> str:
+    """`D:\\x\\y` -> `/d/x/y` (a PATH entry for Git for Windows' bash); POSIX paths are unchanged."""
+    m = re.match(r"^([A-Za-z]):[\\/]?(.*)$", p)
+    return f"/{m[1].lower()}/{m[2].replace(chr(92), '/')}" if m else p
+
+
 @dataclass
 class ExecResult:
     output: str
@@ -70,6 +76,9 @@ class LocalEnvironment:
         self._git_global = str(Path(self.home) / ".gitconfig-empty")
         Path(self._git_global).touch()
         Path(self.home, "gh").mkdir(exist_ok=True)
+        self._bash_env = str(Path(self.home) / ".bash_env")
+        dirs = ":".join(_msys_path(d) for d in self.bin_dirs)
+        Path(self._bash_env).write_text(f'PATH="{dirs}:$PATH"\n', encoding="utf-8", newline="\n")
 
     def child_env(self) -> dict[str, str]:
         env = {k: os.environ[k] for k in _PASS_ENV if k in os.environ}
@@ -83,6 +92,10 @@ class LocalEnvironment:
             "PYTHONDONTWRITEBYTECODE": "1", "PYTHONIOENCODING": "utf-8", "PIP_NO_INPUT": "1",
             "TERM": "dumb", "NO_COLOR": "1", "CLICOLOR": "0",
         })
+        if self.bin_dirs:
+            # Git for Windows' bash puts /mingw64/bin:/usr/bin ahead of the inherited PATH; re-prepend the helper
+            # dirs so their commands (the grep wrapper) win over the system ones
+            env["BASH_ENV"] = self._bash_env
         env.update(self.env)
         return env
 

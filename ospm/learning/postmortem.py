@@ -22,7 +22,7 @@ from ..llm import BudgetExceeded, LLMError
 from ..replay.concerns import concern_metrics
 from ..replay.tasks import ReplayTask
 from .interventions import InterventionLearner, pr_key, resolve_sources
-from .skills import TOOLS_NOTE, Skill, index_block, loaded_skills, offered, slug
+from .skills import TOOLS_NOTE, Skill, index_block, loaded_skills, offered, rubric_block, slug
 
 TraceLookup = Callable[[ReplayTask, str, tuple], "dict | None"]  # (task, ctx, skills) -> trace dict of that episode
 
@@ -126,8 +126,6 @@ def apply_edit(skills: list[Skill], e: dict[str, Any]) -> tuple[list[Skill], Ski
     return rest + [new], new
 
 
-
-
 SPECIALIST_ROLES = ("review", "security")
 TEAM_NOTE = """
 The agent is a TEAM: an orchestrator that spawns specialists (review, security) with written briefs, reads their
@@ -144,6 +142,8 @@ class SkillLearner(InterventionLearner):
     `entry` is the agent the task goes to: "review" (a single reviewer) or "orchestrator" (the team; skills of
     every role are evolved, and each spawned specialist gets the index of its role's skills)."""
 
+    system = "skills"  # how the library is served while learning (see serve)
+
     def __init__(self, *args, trace_of: TraceLookup, entry: str = "review", **kwargs):
         super().__init__(*args, **kwargs)
         self.trace_of = trace_of
@@ -151,17 +151,20 @@ class SkillLearner(InterventionLearner):
         self.roles = (entry,) if entry != "orchestrator" else ("orchestrator", *SPECIALIST_ROLES)
         self.skills: list[Skill] = []
         self.edits: list[dict[str, Any]] = []
+        self.sample = 0  # which independent run of the training episodes this epoch sees (0: the cached first)
+        self.spent: Callable[[], bool] = lambda: False  # true once learning must stop (the library so far is kept)
 
     # ------------------------------------------------------------------ serving
     def serve(self, task: ReplayTask, system: str, skills: list[Skill] | None = None) -> tuple[str, tuple, tuple]:
         """(extra context for the entry agent, offered skills, ((role, context), ...) for spawned specialists).
-        `tool` documents `hist reviews` only; `skills` adds the index of the skills offered for this PR's files."""
-        if system not in ("tool", "skills"):
+        `tool` documents `hist reviews` only; `skills` adds the index of the skills offered for this PR's files;
+        `rubric` inlines those skills' bodies (a mined rubric, `ospm/learning/rubric.py`) instead of offering them."""
+        if system not in ("tool", "skills", "rubric"):
             return self.serve_context(task, system), (), ()
-        lib = (self.skills if skills is None else skills) if system == "skills" else []
+        lib = (self.skills if skills is None else skills) if system in ("skills", "rubric") else []
         files = self.view(task).files
         mine = offered(lib, files, self.entry)
-        ctx = TOOLS_NOTE + index_block(mine)
+        ctx = TOOLS_NOTE + (rubric_block(mine) if system == "rubric" else index_block(mine))
         if self.entry != "orchestrator":
             return ctx, tuple(mine), ()
         per_role = {r: offered(lib, files, r) for r in SPECIALIST_ROLES}
@@ -182,8 +185,8 @@ class SkillLearner(InterventionLearner):
                 missed = []
                 if not mine:
                     continue  # silent on a clean PR: nothing to learn
-            job = self.serve(t, "skills")
-            trace = self.trace_of(t, *job)
+            job = self.serve(t, self.system)
+            trace = self.trace_of(t, *job, **({"sample": self.sample} if self.sample else {}))
             digest = trace_digest(trace, sorted({c["path"] for c in missed}))
             if self.entry == "orchestrator" and trace:
                 digest["team"] = team_digest(trace)
@@ -279,26 +282,42 @@ class SkillLearner(InterventionLearner):
         return ok
 
     # ------------------------------------------------------------------ loop
-    def learn(self, train: list[ReplayTask]) -> dict[str, Any]:
+    def learn(self, train: list[ReplayTask], epochs: int = 1) -> dict[str, Any]:
+        """Chronological batches of `train`, `epochs` times. Epoch n > 1 reruns the training PRs as fresh samples
+        (the library has changed, and a rerun of an unchanged one would otherwise replay the cached outcome)."""
         ordered = sorted(train, key=lambda t: (t.as_of, t.id))
         pending: list[dict] = []  # post-mortems not yet addressed by an adopted edit (rolling pool)
-        for i in range(0, len(ordered), self.cfg.batch):
-            batch = ordered[i:i + self.cfg.batch]
-            outs = self._run_many([(t, *self.serve(t, "skills")) for t in batch])
-            for t, (score, out) in zip(batch, outs):
-                self.history.append({"task": t.id, "score": score, **concern_metrics(t, out),
-                                     "skills": len(self.skills)})
+        for epoch in range(epochs):
+            self.sample = epoch
+            for i in range(0, len(ordered), self.cfg.batch):
+                if self.spent():
+                    self.log(f"[{self.system}] learning budget reached: stopping in epoch {epoch + 1}")
+                    self.sample = 0
+                    return {"skills": [asdict(s) for s in self.skills], "edits": self.edits, "history": self.history}
+                pending = self._step(ordered[i:i + self.cfg.batch], pending,
+                                     f"step {i // self.cfg.batch + 1}" if epochs == 1 else
+                                     f"epoch {epoch + 1} step {i // self.cfg.batch + 1}")
+        self.sample = 0
+        return {"skills": [asdict(s) for s in self.skills], "edits": self.edits, "history": self.history}
+
+    def _step(self, batch: list[ReplayTask], pending: list[dict], label: str) -> list[dict]:
+        outs = self._run_many([(t, *self.serve(t, self.system), *((None, self.sample) if self.sample else ()))
+                               for t in batch])
+        for t, (score, out) in zip(batch, outs):
+            self.history.append({"task": t.id, "score": score, **concern_metrics(t, out),
+                                 "skills": len(self.skills), "epoch": self.sample + 1})
+        if not self.sample:
             self.seen.extend(batch)
             self.now = max(self.now, batch[-1].as_of)
-            items = self.postmortem_items(batch, outs)
-            pending = (pending + items)[-self.cfg.miss_pool:]
-            edits = self.propose(pending)
-            adopted = 0
-            for e in edits:
-                if self.validate_edit(e):
-                    adopted += 1
-                    done = set(e.get("source_tasks") or [])
-                    pending = [it for it in pending if it["task"] not in done]
-            self.log(f"[skills] step {i // self.cfg.batch + 1}: {len(batch)} tasks, {len(items)} post-mortems, "
-                     f"{len(edits)} edits, {adopted} adopted, {len(self.skills)} skills")
-        return {"skills": [asdict(s) for s in self.skills], "edits": self.edits, "history": self.history}
+        items = self.postmortem_items(batch, outs)
+        pending = (pending + items)[-self.cfg.miss_pool:]
+        edits = self.propose(pending)
+        adopted = 0
+        for e in edits:
+            if self.validate_edit(e):
+                adopted += 1
+                done = set(e.get("source_tasks") or [])
+                pending = [it for it in pending if it["task"] not in done]
+        self.log(f"[{self.system}] {label}: {len(batch)} tasks, {len(items)} post-mortems, "
+                 f"{len(edits)} edits, {adopted} adopted, {len(self.skills)} skills")
+        return pending

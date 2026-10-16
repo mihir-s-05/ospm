@@ -17,8 +17,15 @@ from typing import Any, Callable
 
 from ..llm.base import LLMError, UsageMeter
 
+TRUNCATION_RETRIES = 2  # resamples of a turn that ran out of output tokens (typically runaway reasoning)
+
+
+class TruncatedTurn(LLMError):
+    """The model stopped at the output-token limit; the conversation is unchanged, so the turn can be resampled."""
+
 # parallel agents share one tokens-per-minute limit: retry 429s (with the SDK's backoff) instead of failing
 MAX_RETRIES = 10
+ELIDED = "[output elided to save context: {n} characters from an earlier step; rerun the command if you need it again]"
 
 
 @dataclass
@@ -86,14 +93,57 @@ class Conversation(ABC):
     def compact(self, message: str) -> None:
         """Simple compaction: replace the entire history with a single user message."""
 
+    def _tool_outputs(self) -> list[tuple[str, Callable[[str], None]]]:
+        """Every tool result in the history, oldest first, as (output text, setter)."""
+        return []
+
+    def elide(self, keep_last: int, min_chars: int) -> int:
+        """Replace the output of every tool result but the latest `keep_last` by a stub when it is longer than
+        `min_chars`. Returns the characters removed and lowers the context-size estimate by their token share."""
+        outs = self._tool_outputs()
+        removed = 0
+        for text, set_text in outs[:max(0, len(outs) - keep_last)]:
+            if len(text) > min_chars and not text.startswith(ELIDED[:20]):
+                stub = ELIDED.format(n=len(text))
+                set_text(stub)
+                removed += len(text) - len(stub)
+        self.last_input_tokens = max(0, self.last_input_tokens - removed // 4)
+        return removed
+
     def query(self, effort: str | None = "medium", max_tokens: int = 16000) -> ModelTurn:
         self.model.meter.check()
-        turn = self._query(effort, max_tokens)
+        for attempt in range(TRUNCATION_RETRIES + 1):
+            try:
+                turn = self._query(effort, max_tokens)
+                break
+            except TruncatedTurn:
+                if attempt == TRUNCATION_RETRIES:
+                    raise
         turn.cost = self.model.meter_record(turn.input_tokens, turn.output_tokens, turn.cached_tokens,
                                             turn.cache_write_tokens)
         self.last_input_tokens = turn.input_tokens
         self.pending_chars = len(turn.text) + sum(len(c.raw) for c in turn.tool_calls)
         return turn
+
+    @property
+    @abstractmethod
+    def history(self) -> list: ...
+
+    @history.setter
+    @abstractmethod
+    def history(self, value: list) -> None: ...
+
+    def side_query(self, instruction: str, effort: str | None = "low", max_tokens: int = 8000) -> ModelTurn:
+        """One extra turn on the current context with `instruction` as a trailing user message; the conversation is
+        left as it was. The request is a prefix-extension of the last one (same system, tools and history), so the
+        provider serves that prefix from its cache, unlike a fresh request with its own system prompt."""
+        saved = ([dict(m) if isinstance(m, dict) else m for m in self.history], self.last_input_tokens,
+                 self.pending_chars)
+        try:
+            self.add_user(instruction)
+            return self.query(effort, max_tokens)
+        finally:
+            self.history, self.last_input_tokens, self.pending_chars = saved
 
 
 class ChatModel(ABC):
@@ -138,6 +188,14 @@ class OpenAIConversation(Conversation):
         super().__init__(model, system, tools)
         self.items: list[dict] = []
 
+    @property
+    def history(self) -> list:
+        return self.items
+
+    @history.setter
+    def history(self, value: list) -> None:
+        self.items = value
+
     def add_user(self, text: str) -> None:
         self.items.append({"role": "user", "content": text})
         self.pending_chars += len(text)
@@ -146,6 +204,10 @@ class OpenAIConversation(Conversation):
         for r in results:
             self.items.append({"type": "function_call_output", "call_id": r.call_id, "output": r.output})
             self.pending_chars += len(r.output)
+
+    def _tool_outputs(self):
+        return [(str(i.get("output", "")), lambda t, i=i: i.__setitem__("output", t))
+                for i in self.items if isinstance(i, dict) and i.get("type") == "function_call_output"]
 
     def compact(self, message: str) -> None:
         self.items = [{"role": "user", "content": message}]
@@ -174,7 +236,9 @@ class OpenAIConversation(Conversation):
         except Exception as e:
             raise LLMError(f"{m.name} request failed: {type(e).__name__}: {str(e)[:300]}") from e
         if getattr(resp, "status", "completed") not in ("completed", None):
-            raise LLMError(f"{m.name} response {resp.status}: {getattr(resp, 'incomplete_details', None)}")
+            details = getattr(resp, "incomplete_details", None)
+            error = TruncatedTurn if "max_output_tokens" in str(details) else LLMError
+            raise error(f"{m.name} response {resp.status}: {details}")
         calls = []
         compacted = False
         for o in resp.output:
@@ -218,6 +282,14 @@ class AnthropicConversation(Conversation):
         super().__init__(model, system, tools)
         self.messages: list[dict] = []
 
+    @property
+    def history(self) -> list:
+        return self.messages
+
+    @history.setter
+    def history(self, value: list) -> None:
+        self.messages = value
+
     def _append_user_content(self, blocks: list) -> None:
         # consecutive user content is merged into one user message (the API requires alternation)
         if self.messages and self.messages[-1]["role"] == "user":
@@ -238,6 +310,17 @@ class AnthropicConversation(Conversation):
         # tool results must come first in their user message
         self.messages.append({"role": "user", "content": blocks})
         self.pending_chars += sum(len(r.output) for r in results)
+
+    def _tool_outputs(self):
+        outs = []
+        for m in self.messages:
+            if isinstance(m, dict) and m["role"] == "user" and isinstance(m["content"], list):
+                for b in m["content"]:
+                    if isinstance(b, dict) and b.get("type") == "tool_result":
+                        c = b.get("content")
+                        text = c if isinstance(c, str) else "".join(x.get("text", "") for x in c or [])
+                        outs.append((text, lambda t, b=b: b.__setitem__("content", t)))
+        return outs
 
     def compact(self, message: str) -> None:
         self.messages = [{"role": "user", "content": [{"type": "text", "text": message}]}]
@@ -267,7 +350,7 @@ class AnthropicConversation(Conversation):
         if resp.stop_reason == "refusal":
             raise LLMError(f"{m.name} refused ({getattr(getattr(resp, 'stop_details', None), 'category', None)})")
         if resp.stop_reason == "max_tokens":
-            raise LLMError(f"{m.name} hit max_tokens={max_tokens}")
+            raise TruncatedTurn(f"{m.name} hit max_tokens={max_tokens}")
         # append the assistant content unchanged (thinking blocks must round-trip byte-identically)
         self.messages.append({"role": "assistant", "content": resp.content})
         text = "".join(getattr(b, "text", "") for b in resp.content if getattr(b, "type", "") == "text")
@@ -325,6 +408,14 @@ class FakeConversation(Conversation):
         self.view = FakeView(system, [t.name for t in tools])
         self.n = 0
 
+    @property
+    def history(self) -> list:
+        return self.view.transcript
+
+    @history.setter
+    def history(self, value: list) -> None:
+        self.view.transcript = value
+
     def add_user(self, text: str) -> None:
         self.view.transcript.append({"role": "user", "text": text})
         self.pending_chars += len(text)
@@ -333,6 +424,10 @@ class FakeConversation(Conversation):
         for r in results:
             self.view.transcript.append({"role": "tool", "id": r.call_id, "text": r.output, "error": r.is_error})
             self.pending_chars += len(r.output)
+
+    def _tool_outputs(self):
+        return [(e["text"], lambda t, e=e: e.__setitem__("text", t)) for e in self.view.transcript
+                if e["role"] == "tool"]
 
     def compact(self, message: str) -> None:
         self.view.transcript = [{"role": "user", "text": message, "compacted": True}]

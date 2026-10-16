@@ -35,7 +35,10 @@ def _key(path: str, concern: dict, comment: dict) -> str:
 
 
 class Matcher:
-    """P(same concern) for (maintainer concern, agent comment) pairs on the same file, cached in `cache_path`."""
+    """P(same concern) for (maintainer concern, agent comment) pairs on the same file, cached in `cache_path`.
+    Subclasses ask other pairwise questions by overriding QUESTION/YES/NO and `_state`."""
+
+    QUESTION, YES, NO = QUESTION, YES, NO
 
     def __init__(self, cache_path: str | Path, workers: int = 8):
         self.path = Path(cache_path)
@@ -49,12 +52,14 @@ class Matcher:
                     d = json.loads(line)
                     self.cache[d["k"]] = d["p"]
 
+    def _state(self, path: str, concern: dict, comment: dict) -> dict:
+        return {"file": path,
+                "maintainer_comment": {"line": concern.get("line"), "text": str(concern.get("body", ""))[:1500]},
+                "ai_comment": {"line": comment.get("line"), "text": str(comment.get("body", ""))[:1500]}}
+
     def _ask(self, path: str, concern: dict, comment: dict) -> float:
-        state = {"file": path,
-                 "maintainer_comment": {"line": concern.get("line"), "text": str(concern.get("body", ""))[:1500]},
-                 "ai_comment": {"line": comment.get("line"), "text": str(comment.get("body", ""))[:1500]}}
-        body = json.dumps({"model": JEV_MODEL, "state": state, "questions": {"same": {
-            "type": "noul", "instructions": QUESTION, "criteria": {"true": YES, "false": NO}}}}).encode()
+        body = json.dumps({"model": JEV_MODEL, "state": self._state(path, concern, comment), "questions": {"same": {
+            "type": "noul", "instructions": self.QUESTION, "criteria": {"true": self.YES, "false": self.NO}}}}).encode()
         req = urllib.request.Request(JEV_URL, data=body, headers={
             "Authorization": f"Bearer {os.environ['TYPESAFE_API_KEY']}", "Content-Type": "application/json"})
         err: Exception | None = None

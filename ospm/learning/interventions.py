@@ -229,6 +229,11 @@ class LearnConfig:
     validation_pool: int = 150  # most recent earlier tasks (beyond those learned on) a candidate may be checked on
     miss_pool: int = 24  # rolling pool of unexplained misses shown to the proposer (patterns across time)
     workers: int = 4
+    # rubric items (rubric.RubricLearner): runs per validation PR and arm, other past PRs whose concerns must apply
+    # the item before it is replayed at all, and the extra target-concern hits (summed over runs) it must earn
+    samples: int = 1
+    min_support: int = 1
+    min_hit_gain: float = 0.0
 
 
 EpisodeRunner = Callable[[ReplayTask, str], tuple[float, dict | None]]  # (task, extra_context) -> (score, output)

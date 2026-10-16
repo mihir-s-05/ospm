@@ -68,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
             d = json.loads(line)
             cache[d["key"]] = d["output"]
     matcher = Matcher(data / "semantic_cache.jsonl")
-    ids = [r["task"] for r in result["rows"]["none"]]
+    ids = [r["task"] for r in result["rows"]["none"] if r["task"] in tasks]  # tasks dropped from the data are skipped
     out: dict[str, Any] = {"result": str(res_path), "entry": entry, "who": who, "systems": {}}
     per: dict[str, dict[str, dict]] = {}
     for system in systems:

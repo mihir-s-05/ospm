@@ -30,6 +30,11 @@ the natural second repository for transfer.
   a comment budget (3).
 - **Negative episode:** a PR maintainers approved and merged without any maintainer inline comment. The agent should
   stay silent; this measures false alarms. AI review bots' comments are ignored.
+- **AI-written text from maintainer accounts** is not ground truth (`concerns.is_ai_text`). An example is SGLang's
+  `[by Codex] **Severity: style | Confidence: High**` reviews, or a pasted Codex review. A review made only of such
+  comments yields no task at all. This dropped 128 concerns and 52 tasks from SGLang's newest val/test PRs, and 1
+  train task from PyTorch. Backups are kept as `tasks.pre_ai_filter.jsonl`. None of the dropped tasks was in an
+  earlier experiment's test set, so every SGLang result below is unchanged; rescoring confirmed this.
 - **Maintainers** are reviewers with an OWNER/MEMBER/COLLABORATOR association, or anyone who approved at least two
   merged PRs. The second rule matters for vLLM, whose committers often appear as CONTRIBUTOR.
 - **Splits are chronological:** the oldest 60% is train, the next 20% val, the newest 20% test.
@@ -135,13 +140,20 @@ because its objective ignored cost and its unit (path-scoped skills) could not e
   `tests`, `design_docs` and a `history` researcher (contract `notes`) to the built-in reviewer and security types.
   The orchestrator's prompt lists the current library, so library edits change whom it can spawn.
 - **Three levels of edits**, one per edit: *agent* (a type's rules or description), *library* (add or remove a
-  type) and *team* (the orchestrator's coordination rules).
+  type) and *team* (the orchestrator's coordination rules, and `set_board` to switch the shared notepads on or off).
 - **Per-agent credit** from the traces, judged semantically: per type, how often it was spawned, its cost and
   steps, the maintainer concerns it found (and found alone), and its comments on clean PRs; for the orchestrator,
-  its own cost, bash steps and coordination calls.
-- **Cost-aware acceptance:** replay other earlier PRs (3 with concerns from distinct PRs + 3 clean; source PRs
-  excluded) with the current and the edited team. Adopt if quality (semantic score; clean PRs score on silence)
-  rises by ≥ 0.01 at ≤ 1.3× the cost, or stays level while the cost falls by ≥ 15%.
+  its own cost, the episode's derived latency, bash steps and coordination calls. The reflector also sees the
+  team's mean cost and latency over recent PRs.
+- **Cost- and latency-aware acceptance:** replay other earlier PRs (3 with concerns from distinct PRs + 3 clean;
+  source PRs excluded) with the current and the edited team. An edit is adopted in three cases:
+  - quality (semantic score; clean PRs score on silence) rises by ≥ 0.01 at ≤ 1.3× the cost;
+  - quality stays level while the cost falls by ≥ 15%;
+  - quality stays level while the derived latency falls by ≥ 15% at ≤ 1.3× the cost.
+
+  No edit may make episodes more than 1.5× slower. Latency is the critical path through the episode's agents
+  (`ospm/harness/latency.py`, see `docs/AGENT_TEAM.md`). It uses measured tool times only when every compared
+  episode has them; otherwise it uses nominal ones, so cached older episodes are compared like for like.
 - **Test:** the seed library team vs. the evolved team on the same test PRs, with per-type credit on the test set.
 
 ## Measurement: semantic concern matching (`ospm/replay/semantic.py`)
@@ -177,7 +189,79 @@ baseline is weaker than the line rule suggested: on vLLM the reviewer recovers e
 concerns (the 50-step run's two ±5-line "hits" were a formatting nit and a mypy question matched to unrelated
 comments). From here on, validation and evaluation use semantic matching.
 
+## Which repositories can learning help? Recurrence of maintainer concerns (`ospm/replay/recurrence.py`)
+
+Lessons, skills and memory can only help when maintainers raise the same reusable rule again on later PRs. This is
+measured directly. For 200 sampled non-nit maintainer concerns of each repository's test split (its newest PRs),
+the 8 most similar earlier concerns from *other* PRs are retrieved by TF-IDF (text and path). Jev then judges two
+things: does an earlier comment apply the same reusable rule ("recurs"), and is that rule a convention of the
+project rather than general advice the model already knows ("project-specific")?
+
+- Two thresholds are reported, strict (P ≥ 0.8, the matching threshold) and loose (P ≥ 0.5). Terse restatements
+  such as Django's "(Chop.)" for "remove the docstrings" fall in between.
+- AI review text posted from maintainer accounts is excluded. On SGLang this is 15% of the newest concerns
+  (`[by Codex] **Severity: style | Confidence: High**`); none were in the test sets of the SGLang experiments above.
+- To compare repositories of different volume, each concern searches a random 1,000 of the earlier concerns.
+- Retrieval is lexical, so the shares are lower bounds.
+- Cost: under $0.40 of Jev for all seven repositories.
+
+| repository (mirror) | recurs (strict / loose) | project-specific (strict / loose) | median gap to the earlier comment |
+|---|---:|---:|---:|
+| **Home Assistant** (4 months) | **26.5% / 56.5%** | **13.0% / 24.5%** | 58 days |
+| SGLang (4 months) | 12.5% / 40.0% | 4.5% / 15.5% | 73 days |
+| vLLM (4 months) | 10.0% / 36.0% | 1.5% / 10.5% | 64 days |
+| Django (2 years) | 10.0% / 34.0% | 6.0% / 12.0% | 224 days |
+| PyTorch (2 months) | 7.0% / 27.0% | 3.0% / 11.0% | 21 days |
+| Rust (4 months) | 6.0% / 27.5% | 2.5% / 8.5% | 68 days |
+| pytest (28 concerns only) | 3.6% / 17.9% | 0% / 0% | — |
+
+- **Almost all recurrences are a rule applied to a different PR author** (for example 26 of the 26.5 points on Home
+  Assistant), not one author's follow-up PR.
+- **Home Assistant is the outlier:** two to four times the recurrence of every other repository. Its recurring
+  rules are written conventions that are applied across integrations:
+  - sentence case and common translation keys in `strings.json`;
+  - omit the translation key when the name equals the device class;
+  - tests must set up the integration and not build a coordinator directly;
+  - reconfigure and reauth flows are not quality-scale exemptions;
+  - do not put exception text in translatable errors.
+- **Formal process alone is not enough.** Django and Rust recur no more than vLLM and SGLang, although an earlier
+  hand-labelled survey ranked them high (`data/results/repo_survey/`, 13 repositories by Haiku agents with one shared
+  rubric). That survey clustered generic rules ("add a test", "keep the docs accurate"), which the pairwise judge
+  does not count as the same rule. Django has the highest project-specific share outside Home Assistant (release-note
+  placement, docs admonitions and links).
+- **A longer mirror helps, with diminishing returns.** Strict recurrence against the number of earlier concerns
+  searched (project-specific in brackets):
+
+  | earlier concerns | 250 | 500 | 1,000 | 2,000 | all (4 months) |
+  |---|---:|---:|---:|---:|---:|
+  | vLLM | 6.0% (0%) | 6.0% (0.5%) | 10.0% (1.5%) | 13.5% (3.0%) | 15.0% (3.0%) |
+  | SGLang | 4.5% (2.0%) | 9.5% (3.5%) | 12.5% (4.5%) | 13.5% (5.0%) | 15.5% (6.5%) |
+  | Home Assistant | | | 26.5% (13.0%) | | 31.5% (14.5%) |
+
+  Recurrence about doubles from 500 to 2,000 earlier concerns, then levels off. Two to three years of vLLM would add
+  a few points, not an order of magnitude.
+- **The agent-tool repositories cannot be replayed for review:**
+  - `openai/codex` has been an import-only mirror of an internal repository since mid-2026 and accepts no external
+    PRs;
+  - opencode: 1.7% of merged PRs have any human review, and bots make 85% of review comments;
+  - pi: the maintainer self-merges 56% of PRs, 95% of them with no other review.
+
+**Implication:** on vLLM, SGLang, PyTorch, pytest, Django and Rust, at most ~5% of maintainer concerns restate a
+project rule that a lesson could teach. This bounds what knowledge-shaped learning could have added, and is
+consistent with every result above. Home Assistant (13% strict, 25% loose) is the one repository where learned
+conventions have a real chance.
+
 ## Results so far
+
+**Significance.** Paired results now carry an exact McNemar p-value (a two-sided binomial test of wins against
+losses), Benjamini–Hochberg-corrected across the systems in a run (`ospm/learning/stats.py`, as in Fan et al.
+2026). Recomputed for every earlier run below, no comparison comes close to significance, with one exception:
+the evolved Home Assistant rubric on the 96 test PRs with maintainer concerns (9 wins, 0 losses, p = 0.004; see
+the last results).
+- Home Assistant rubric (first 96 test PRs): p = 0.73.
+- SGLang `tool` and `skills`: p ≥ 0.77.
+- PyTorch: p ≥ 0.38.
+- SGLang team evolution vs the seed team: p = 0.29.
 
 - **pytest pipeline check:** 12 val tasks with the fixed agent scored 0.625 at $0.007 per episode, with 2 of 6
   positives matched and negatives mostly silent.
@@ -302,3 +386,238 @@ comments). From here on, validation and evaluation use semantic matching.
 
   Team + tool vs team: 6/6/36. The team matches a single reviewer at about twice the cost (as on pytest), and the
   tool again changes outcomes in both directions with no net gain.
+- **SGLang, stage C: team evolution** (`data/results/team_evolution_sglang*`; 32 train / 32 test PRs, chronological,
+  starting from the seed library; $6.60 training + $1.18 test, the test phase resumed from the episode cache after an
+  OpenAI tokens-per-minute stop).
+  - **12 edits proposed over 4 steps, 3 adopted, all for quality** on independent replays:
+
+    | adopted edit | validation quality | cost |
+    |---|---|---:|
+    | rule: *"Do not spawn security by default; spawn it when the diff changes a security-sensitive boundary"* | 0.41 → 0.47 | 0.90× |
+    | remove the `tests` type | 0.46 → 0.50 | 0.87× |
+    | remove the `history` type | 0.50 → 0.54 | 0.85× |
+
+    Of the 9 rejected, 4 were earlier attempts at the same removals (one, removing `tests` in step 1, lowered quality
+    0.71 → 0.63); the others were a `design_docs` rule, two `design_docs` descriptions, a `security` rule and an
+    orchestrator rule for CI workflow changes, none of which raised quality.
+  - **Test** (32 PRs, 16 with concerns):
+
+    | team | mean score | semantic recall | soft recall | silent on clean PRs | cost / episode |
+    |---|---:|---:|---:|---:|---:|
+    | seed library | 0.495 | 0.13 | 0.16 | 50% | $0.047 |
+    | evolved | 0.477 | 0.13 | 0.15 | 38% | $0.035 |
+
+    Paired 2/6/24. **The evolution removed exactly the waste the credit showed** and cut cost by 24% at the same
+    recall: on the test set the seed's `security` (18 spawns), `history` (23) and `tests` (30) found no concern
+    alone, and the evolved orchestrator spawned `security` on none of the 32 PRs. The loss is noise on clean PRs:
+    every paired difference on a PR with concerns is a tie but one (0.25 → 0.19), and on clean PRs the evolved team
+    made one extra comment on 5 and one fewer on 2. Its `design_docs` agent commented on clean PRs more often (11 vs
+    6), so the next edit the credit points at is a `design_docs` rule; the training's two attempts at one were
+    rejected.
+  - **Conclusion:** team-level evolution works as a cost optimiser (a smaller, cheaper team at equal recall) but,
+    like lessons and skills, has not raised recall: no type in the library finds what the maintainers raise.
+- **PyTorch: memory, history tool and evolved skills, single reviewer** (`data/results/learning_pytorch*`; 48 train /
+  48 test PRs, chronological, 24 with concerns each; semantic validation and scoring; $1.58, 6.2 h). All 2,967 calls
+  succeeded and every test episode produced a review.
+
+  | system | mean score | semantic recall | soft recall | silent on clean PRs | paired vs none (W/L/T) | coverage |
+  |---|---:|---:|---:|---:|---|---:|
+  | none | 0.476 | 0.01 | 0.08 | 75% | — | — |
+  | memory | 0.458 | 0.00 | 0.06 | 67% | 1/4/43 | 94% |
+  | tool (`hist reviews` documented) | 0.464 | 0.00 | 0.01 | 75% | 1/3/44 | 100% |
+  | skills (tool + evolved library) | 0.464 | 0.00 | 0.01 | 75% | 1/3/44 | 2% |
+
+  - **PyTorch is the hardest repository so far.** The plain reviewer matched part of one maintainer concern in 24
+    PRs and wrote 0.8 comments per PR with concerns.
+  - **20 skill edits proposed, 1 adopted:** 11 had no other past PR in their area, 5 gave no gain on other PRs and
+    3 added comments on clean PRs. The adopted `inductor-optimization-changes` (+0.11 on 3 independent PRs, no
+    extra comments on 3 clean ones) applied to 1 of 48 test PRs, where it was loaded without changing the outcome,
+    so the skills arm equals the tool arm.
+  - Memory and the tool changed 4–5 outcomes each, almost all on clean PRs, and lost the one partial match.
+  - **Conclusion:** the same as on vLLM and SGLang. At this scale neither past reviews nor evolved procedures help
+    the reviewer find the specific issues maintainers raise.
+- **Home Assistant: memory, history tool and evolved skills, single reviewer** (`data/results/learning_ha_skills*`;
+  64 train / 96 test PRs, chronological, 48 with concerns in the test set; mirror of 4 months, default branch `dev`;
+  $1.91, 8.3 h). Chosen as the repository with the most recurring project conventions (13% strict, 25% loose,
+  above). All 4,153 calls succeeded and every test episode produced a review.
+
+  | system | mean score | semantic recall | soft recall | silent on clean PRs | paired vs none (W/L/T) | coverage |
+  |---|---:|---:|---:|---:|---|---:|
+  | none | 0.490 | 0.00 | 0.03 | 92% | — | — |
+  | memory | 0.490 | 0.00 | 0.03 | 92% | 2/2/92 | 100% |
+  | tool (`hist reviews` documented) | 0.500 | 0.00 | 0.03 | 92% | 2/1/93 | 100% |
+  | skills (tool + evolved library) | 0.492 | 0.00 | 0.03 | 94% | 2/1/93 | 29% |
+
+  - **The reviewer almost never objects.** On the 48 PRs with maintainer concerns it wrote 0.27 comments per PR
+    (0.19–0.35 for the other systems) and approved most of them. Its few comments were mostly sound but different
+    points, e.g. "clarify that a zero `timedelta` skips the transition" where the maintainer asked to pass `None`
+    on the same line.
+  - **28 skill edits proposed, 1 adopted.** Most were integration-specific (SolarEdge Modbus, a map-tile proxy,
+    Google Assistant exposure migrations) and had no other past PR in their area or no gain on the PRs they had.
+    The adopted `ha-entity-lifecycle` (unique-ID stability, device grouping, availability, entity metadata) is
+    generic integration-review advice. It was offered on 28 test PRs and loaded on 16, without a match.
+  - **The post-mortems never proposed the conventions that recur** (`strings.json` sentence case, common
+    translation keys, tests that set up the integration instead of a coordinator): a post-mortem sees one missed
+    concern on one PR, and validation needs that concern's rule to recur in the next few dozen PRs.
+  - **Environment fix found by this run.** `grep -R` over Home Assistant's 28k files took 100–400 s on Windows (past
+    the 180 s command timeout; 14% of episodes lost a search). The sandbox now runs recursive greps through
+    `git grep` (`ospm/harness/fastgrep.py`; 1–3 s). Earlier repositories were barely affected (recursive-grep
+    timeouts in 2.3% of SGLang episodes, about 1% on vLLM and PyTorch, none on pytest). The run above used the fix.
+  - **Conclusion:** even on the repository with the most recurring conventions, the plain reviewer's recall is ~0
+    and nothing the post-mortems learned changes it. The limit is mostly the reviewer's willingness to raise a
+    maintainer's kind of objection; the post-mortems also never wrote the rules that recur (next result).
+
+- **Home Assistant: a review rubric mined from the review history** (`ospm/learning/rubric.py`,
+  `data/results/rubric_ha*`, `data/results/learning_ha_rubric*`; same 96 test PRs; $0.01 to write the rubric,
+  $0.77 for the run, 2.8 h). This method does not wait for a post-mortem to find a rule. It mines the rules directly:
+  - The recurrence judges link earlier maintainer concerns from different PRs that apply the same
+    project-specific rule (1,500 sampled concerns from before the test period, 8 TF-IDF candidates each).
+  - Linked concerns are clustered, and a cluster on more than 40 PRs is re-split on its stronger links.
+  - One LLM call writes the 84 clusters seen on 3 or more PRs as checkable items: *rule*, *applies when*, *check*,
+    and a maintainer's example.
+  - The result is 58 items in 6 areas with file globs (config flows; integration tests; translations and strings;
+    entities and device model; runtime architecture; manifests and quality scale). Each area is one skill,
+    `rubric-<area>`.
+  - Two ways to serve it: `skills` (the index of area skills; the agent loads them with `skill <name>`) or
+    `rubric` (the matching areas' items inlined into the reviewer's context).
+
+  | system | mean score | semantic recall | soft recall | comments per PR with concerns | silent on clean PRs | paired vs none (W/L/T) |
+  |---|---:|---:|---:|---:|---:|---|
+  | none | 0.490 | 0.00 | 0.03 | 0.27 | 92% | — |
+  | skills (rubric areas on demand) | 0.503 | 0.02 | 0.05 | 0.35 | 94% | 4/2/90 |
+  | **rubric (inlined)** | **0.511** | **0.05** | **0.09** | 0.50 | 90% | 5/3/88 |
+
+  - **First system to beat the plain reviewer on Home Assistant, but within noise.**
+    - Inlined, the rubric matched maintainer concerns on 3 of 48 PRs. The plain reviewer matched none.
+    - Two of the three matches restate a rubric item:
+      - *"Please move the `python-ecobee-api` version bump into a separate PR"*, from *submit dependency bumps
+        separately from feature work*;
+      - *"keep third-party exception details out of the translated `UpdateFailed` message"*, from *keep exception
+        details out of translated messages*.
+    - The third, *pass `user_input={}` explicitly* in a config-flow test, was also found with the skills index.
+    - With 5 wins and 3 losses (sign test p ≈ 0.7), this is not yet evidence.
+  - **Inlining beats loading on demand.** The area skills were offered on 90 of 96 test PRs, and the agent loaded
+    at least one on 87. It still matched less with the index than with the inlined rubric. A rubric is a checklist,
+    so it works when it is in front of the reviewer while they read the diff.
+  - **The cost is a little more noise.** The rubric reviewer raised comments on 5 of 48 clean PRs, against 4 for
+    `none`. One of these, *remove `etherscan` from the analytics fixture along with the integration*, is
+    plausible but was not asked for. The reviewer is still mostly silent: 0.50 comments per PR with concerns,
+    against 1.6 maintainer concerns per such PR.
+  - **Mining is cheap and leak-free.** The rubric uses only concerns from before the first test PR. Writing it took
+    one LLM call, and the recurrence judges' links are cached Jev judgements. Unlike post-mortem skills, the
+    items are cross-integration conventions, the ones maintainers actually repeat.
+
+- **Rubrics on more PRs and other repositories, evolved by post-mortems** (`data/results/learning_*_rubric*.json`).
+  - The test set was grown to 192 Home Assistant PRs (96 with concerns, 96 clean).
+  - Rubrics were mined the same way for Django (24 items, 4 areas), SGLang (30 items, 5 areas) and PyTorch
+    (16 items, 6 areas).
+  - The `evolved_rubric` system starts from the mined rubric. Post-mortems of the 64 training PRs then add, edit
+    or remove one item at a time (`RubricLearner`).
+  - Each p-value is split by PR type. On PRs with concerns a rubric can only add recall; on clean PRs it can only
+    add false alarms. Mixing the two hides an effect behind the clean-PR noise.
+
+  | repository (test PRs) | system | mean score | semantic recall | silent on clean PRs | W/L all (p) | W/L on PRs with concerns (p) |
+  |---|---|---:|---:|---:|---|---|
+  | Home Assistant (192) | none | 0.490 | 0.026 | 82% | — | — |
+  | | mined rubric | 0.503 | 0.061 | 81% | 12/11 (1.0) | 4/0 (0.13) |
+  | | **evolved rubric** | **0.517** | **0.090** | 80% | 15/10 (0.42) | **9/0 (0.004; BH 0.008)** |
+  | Django (96) | none | 0.521 | 0.085 | 85% | — | — |
+  | | mined rubric (= evolved) | 0.504 | 0.044 | 88% | 5/5 (1.0) | 2/3 (1.0) |
+  | SGLang (48) | none | 0.502 | 0.097 | 62% | — | — |
+  | | mined rubric | 0.458 | 0.042 | 58% | 3/8 (0.23) | 1/3 (0.63) |
+
+  - **Home Assistant: the evolved rubric is the first learned system with a significant effect.**
+    - It won on 9 PRs with maintainer concerns and lost on none (p = 0.004).
+    - Over all 192 PRs the result is within noise: on clean PRs it had 6 wins and 10 losses, the ordinary run-to-run
+      variance of whether the reviewer stays silent.
+    - Only 2 of 28 edits were adopted. One sharpened *test integration behaviour through Home Assistant, not
+      internal objects*; the other added *keep diagnostics out of an initial integration PR*.
+  - **Django and SGLang: no effect.** The rubric made the reviewer comment more (Django 0.98 → 1.29 comments per PR
+    with concerns) but match fewer concerns.
+    - Their recurring project-specific concerns are 2–6% of all concerns, against 13% on Home Assistant (see the
+      recurrence measure above).
+    - The post-mortems adopted none of 15 edits on Django and none of 18 on SGLang.
+    - The SGLang learning run stopped at step 7, when one reviewer turn ran past the 16k output-token limit. Such
+      turns are now resampled up to twice (`harness.models.TruncatedTurn`), and the none/rubric comparison was run
+      separately.
+  - **PyTorch was dropped.** Its baseline recall is 0.01, so a rubric run would have had nothing to measure.
+  - **Why so few edits were adopted.**
+    - An edit was validated on the past PRs whose concerns were most similar to it: in practice one PR in the
+      150-task validation pool, run once with and once without the edit.
+    - The reviewer misses about 90% of concerns either way, so that one PR scored 0 both times and the gain was 0.
+      In 8 cases no such PR was found at all.
+    - The post-mortems also kept re-proposing rejected rules: *no single-case `parametrize`* came up 4 times.
+
+- **Ceiling: how much could a perfect rubric help?** (`ospm/learning/ceiling.py`, `data/results/ceiling_ha.json`;
+  the 96 Home Assistant test PRs with concerns; $1.02).
+  - Each maintainer concern was rewritten by the LLM as the general rule it applies, without file, line or
+    PR-specific detail. The reviewer was then run with the mined rubric plus those rules in two ways:
+    - as one more rubric area (`oracle_items`);
+    - as "maintainers found that this PR violates these rules" (`oracle_violations`).
+  - The rewritten rules stay close to the concern they come from, so this is an upper bound, not a realistic rubric.
+
+  | system | semantic recall | comments per PR | W/L vs none (p) |
+  |---|---:|---:|---|
+  | none | 0.026 | 0.39 | — |
+  | mined rubric | 0.061 | 0.57 | 4/0 (0.13) |
+  | evolved rubric | 0.090 | 0.49 | 9/0 (0.004) |
+  | oracle rules as rubric items | 0.298 | 0.98 | 35/0 (<0.001) |
+  | told the PR violates them | 0.670 | 1.65 | 69/0 (<0.001) |
+
+  - **The reviewer is not the bottleneck.** Given the right items it finds 11× more concerns, and told what is
+    wrong it finds two thirds of them.
+  - **The gap is coverage.** The learned rubric reaches 0.09 against 0.30 for one with the right items, so a
+    learner that writes and keeps more of the right items has real headroom.
+  - This motivated a stronger validation gate for rubric edits:
+    - **Support from all of history.** A Jev judge (`rubric.ItemJudge`) finds earlier PRs whose maintainer concerns
+      apply the item, searching all of history rather than the 150-task pool. An edit with fewer than
+      `--min-support` such PRs is rejected without any replay. In the first try, restricted to the pool, every edit
+      found at most one such PR.
+    - **Repeated sampling.** Each validation PR runs `--samples` times with and without the edit (`sample` n > 0 is
+      a separate cached episode). The edit must raise the target concerns at least `--min-hit-gain` more times over
+      all runs, without more comments per clean-PR run than `--max-fp-increase` allows.
+    - **Memory of rejections.** Rejected edits, with their numbers, are shown to later post-mortems. Near-copies
+      are rejected without a replay.
+    - **Epochs.** `--epochs` passes over the training PRs. Later epochs rerun them as fresh samples, so an
+      unchanged rubric does not just replay the cached outcome.
+    - **Budget.** `--learn-budget` ends learning early but keeps the rubric learned so far for evaluation.
+
+- **Home Assistant with the stronger gate** (`data/results/learning_ha_rubric_epochs*`). Settings:
+  - 2 epochs; 3 runs per validation PR and arm; at least 2 supporting PRs; at least 2 extra target hits.
+  - Learning stopped at its $5.50 cap after 15 of 16 steps. The run took 6.6 h and cost $6.54.
+
+  | system (192 test PRs) | semantic recall | silent on clean PRs | W/L on PRs with concerns (p) | W/L on clean PRs |
+  |---|---:|---:|---|---|
+  | none | 0.026 | 82% | — | — |
+  | mined rubric | 0.061 | 81% | 4/0 (0.13) | 8/11 |
+  | evolved, stronger gate | 0.040 | 83% | 3/1 (0.63) | 7/7 |
+  | evolved, first gate (above) | 0.090 | 80% | 9/0 (0.004) | 6/10 |
+
+  - **The gate now runs on real evidence.**
+    - Of 42 edits, 7 were rejected as not recurring and 6 as repeats of rejected edits; 29 were replayed and 4 adopted.
+    - The replayed edits each had 2–3 supporting PRs; 27 of the 29 had 3.
+    - The adopted edits raised their target concerns in 2–6 more of 9 runs, without more comments on clean PRs:
+      - *defer diagnostics from an initial integration PR*;
+      - *test through Home Assistant, not internal objects*;
+      - *catch specific exceptions outside config flows*;
+      - *reuse established helpers*.
+  - **The adopted edits did not transfer.** On the test PRs the evolved rubric matched fewer concerns than the
+    mined rubric it started from (0 wins and 2 losses against it).
+  - **The earlier significant result did not replicate.** That rubric had 2 of these 4 edits and scored 9/0; this
+    one, nearly a superset, scored 3/1.
+    - Each test PR is run once, and the validation runs show how much one reviewer run varies. The same PR and
+      context raised its target concern in 0 to 3 of 3 runs, and one edit's arms went from 7 hits to 0.
+    - A 9-to-3 swing in wins is within that variance, so the p = 0.004 above is best read as a lucky draw.
+  - **Validation is closer to the oracle than to the test.** The supporting PRs are the ones whose concerns the
+    item states, almost verbatim, so the item tells the reviewer what to look for. That is the `oracle_items`
+    condition, where recall is 0.30. On a new PR the item has to generalise, and these did not.
+
+- **Environment fixes found by these runs.**
+  - **Worktree pool.** A Home Assistant checkout takes minutes on Windows, so pooled worktrees are reused. Each gets
+    a brand-new `.git` and a forced checkout and clean (`ReplayRepo.pool_size`).
+  - **Prefetch by object id.** Blobs missing from the partial-clone mirror are fetched by id. This replaced a
+    scratch checkout of the whole tree: 4 s instead of about 150 s per new commit.
+  - **Reflog leak.** The cloned workspace's HEAD reflog named the mirror's current default-branch tip, a future
+    commit, so `.git/logs` is now removed. No agent trace had ever read it.
+  - **Missing grep paths.** The `git grep` shim skips missing path operands and reports them the way GNU grep
+    does. They no longer fall back to the slow real grep.

@@ -7,19 +7,27 @@ the episodes, and proposes edits, each at ONE level:
 
 * agent   - one type's rules (`add_rule` / `edit_rule` / `remove_rule`) or its description (when it is spawned);
 * library - `add_type` (a new specialist for concerns nobody catches) or `remove_type` (no contribution);
-* team    - the orchestrator's own rules (which types to compose, what a brief contains, no duplicate work, ...).
+* team    - the orchestrator's own rules (which types to compose, what a brief contains, no duplicate work, ...)
+            and `set_board` (a shared notes board where the agents post what they covered and found).
 
 An edit is kept only if replaying other earlier PRs (source PRs excluded; outcomes known by then) shows it helps:
 quality (semantic concern score; clean PRs score on silence) must rise without the cost growing more than
-`max_cost_ratio`, or stay level while the cost falls by `min_saving`. Cost is measured per episode, so a
-cost-saving edit (dropping a type that never contributes, stopping duplicate reading) is visible on a few replays.
+`max_cost_ratio`, or stay level while the cost or the latency falls by `min_saving`; no edit may make the episodes
+slower than `max_latency_ratio`. Latency is the critical path through the episode's agents
+(ospm/harness/latency.py), so parallel specialists overlap and sequential waiting adds up. Cost and latency are
+measured per episode, so a saving (dropping a type that never contributes, stopping duplicate reading, running
+specialists in parallel) is visible on a few replays.
 
     python -m ospm.learning.team_evolution --data data/sglang --train 64 --test 48 --budget 9
+
+With `--rubric <mined rubric skills>` nothing is learned: the seed library is compared on the test PRs with the
+same library plus one specialist per rubric area (`ospm/learning/rubric.py`).
 """
 
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import sys
 import time
@@ -27,6 +35,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
+from ..harness.latency import derived_latency, timed
 from ..harness.models import make_chat_model
 from ..llm import LLM, BudgetExceeded, LLMError, UsageMeter, make_llm
 from ..replay.semantic import THRESHOLD, Matcher, semantic_metrics, semantic_score
@@ -35,14 +44,18 @@ from ..replay.workspace import ReplayRepo
 from ..team.roles import TeamGenome, parse_json, seed_library, specialist
 from .experiment import BudgetStop, JsonlCache, make_runner, pick, summarise
 from .interventions import pr_key, resolve_sources
+from .rubric import rubric_team
+from .skills import load as load_skills
+from .stats import paired
 
-OPS = ("add_rule", "edit_rule", "remove_rule", "set_description", "add_type", "remove_type")
-LEVEL = {"add_type": "library", "remove_type": "library"}
+OPS = ("add_rule", "edit_rule", "remove_rule", "set_description", "add_type", "remove_type", "set_board")
+LEVEL = {"add_type": "library", "remove_type": "library", "set_board": "team"}
 
 REFLECT_SYSTEM = """You improve a TEAM of code-review agents for one repository. An orchestrator receives each pull
 request, spawns specialists from a LIBRARY of agent types (each has a description the orchestrator reads, its own
 procedure, and a list of rules), reads their final messages and writes the final review. The goal is the comments
-the maintainers actually made (and silence on changes they approved as-is), at the lowest cost.
+the maintainers actually made (and silence on changes they approved as-is), at the lowest cost and latency (the
+critical path of an episode: specialists running in parallel overlap, waiting on them in sequence adds up).
 
 You get the current library, the orchestrator's rules, per-type credit over recent PRs (how often each type was
 spawned, what it cost, how many maintainer concerns it found - and how many ONLY it found -, how many comments it
@@ -52,7 +65,8 @@ raised false alarms.
 Propose edits; each edit changes ONE thing at ONE level:
 - team (target "orchestrator"): add_rule / edit_rule / remove_rule on the orchestrator's coordination rules - which
   types to spawn for which changes, what a brief must contain, not re-reading what a specialist covers, verifying
-  a finding before adding it, when to follow up on a report.
+  a finding before adding it, when to follow up on a report. Also set_board (text "on" or "off"): a shared
+  notes board on which every agent posts what it covered and found, against duplicate reading.
 - agent (target = a type): add_rule / edit_rule / remove_rule on that type's procedure rules, or set_description
   (changes when the orchestrator spawns it).
 - library: add_type (name, description, focus = the new type's instructions, contract "review" for reviewers or
@@ -66,7 +80,8 @@ def _schema() -> dict:
     edit = {"type": "object", "properties": {
         "op": {"type": "string", "enum": list(OPS)}, "target": {"type": "string"},
         "index": {"type": "integer", "description": "rule index for edit_rule/remove_rule, else -1"},
-        "text": {"type": "string", "description": "rule text, description (set_description) or focus (add_type)"},
+        "text": {"type": "string", "description": "rule text, description (set_description), focus (add_type) "
+                 "or on/off (set_board)"},
         "description": {"type": "string", "description": "add_type only, else empty"},
         "contract": {"type": "string", "enum": ["review", "notes", ""]},
         "rationale": {"type": "string"}, "source_tasks": {"type": "array", "items": {"type": "string"}}},
@@ -84,7 +99,12 @@ def apply_edit(genome: TeamGenome, e: dict[str, Any]) -> TeamGenome | None:
     """The edited team, or None for an invalid or no-op edit. The input genome is never mutated."""
     g = genome.clone()
     op, target, text = e["op"], (e.get("target") or "").strip(), (e.get("text") or "").strip()[:1500]
-    if op == "add_type":
+    if op == "set_board":
+        on = text.lower() in ("on", "true", "yes")
+        if on == g.board:
+            return None
+        g.board = on
+    elif op == "add_type":
         name = "".join(ch if ch.isalnum() else "_" for ch in target.lower()).strip("_")[:32]
         desc = (e.get("description") or "").strip()[:400]
         if not name or name in g.roles or not text or not desc:
@@ -141,9 +161,10 @@ def episode_credit(trace: dict | None, task: ReplayTask, matcher: Matcher) -> di
         agents.append({"type": ch.get("role"), "cost": ch.get("cost", 0.0), "steps": len(ch.get("steps", [])),
                        "comments": len(mine), "found": found, "exit": ch.get("exit_status")})
     calls = [c["name"] for s in trace.get("steps", []) for c in s.get("calls", [])]
-    orch = {"cost": trace.get("cost", 0.0), "bash_steps": calls.count("bash"),
+    orch = {"cost": trace.get("cost", 0.0), "latency_s": derived_latency(trace, timed(trace)),
+            "bash_steps": calls.count("bash"),
             "coordination": {k: calls.count(k) for k in ("spawn_agent", "send_message", "wait_for_agents",
-                                                         "close_agent") if calls.count(k)}}
+                                                         "close_agent", "post_note", "read_notes") if calls.count(k)}}
     return {"agents": agents, "orchestrator": orch}
 
 
@@ -180,7 +201,8 @@ class TeamEvoConfig:
     validate_neg: int = 3  # ... and clean PRs
     min_gain: float = 0.01  # quality gain for an edit that does not cut cost
     max_cost_ratio: float = 1.3  # ... and the most extra cost such an edit may bring
-    min_saving: float = 0.15  # cost cut for an edit that keeps quality level
+    min_saving: float = 0.15  # cost or latency cut for an edit that keeps quality level
+    max_latency_ratio: float = 1.5  # no adopted edit may slow the episodes down more than this
     validation_pool: int = 150
     workers: int = 4
 
@@ -257,7 +279,12 @@ class TeamEvolver:
             rules = "".join(f"\n    [{i}] {p}" for i, p in enumerate(r.playbook))
             lib.append(f"- {name} (contract {r.contract or name}): {r.description}{rules}")
         orch = "".join(f"\n  [{i}] {p}" for i, p in enumerate(self.genome.roles["orchestrator"].playbook)) or " (none)"
-        user = ("# Library\n" + "\n".join(lib) + f"\n\n# Orchestrator rules{orch}\n\n# Credit per type (this and "
+        board = "on" if self.genome.board else "off"
+        recent = self.history[-32:]
+        mean = lambda k: round(sum(h.get(k) or 0 for h in recent) / max(1, len(recent)), 4)  # noqa: E731
+        user = ("# Library\n" + "\n".join(lib) + f"\n\n# Orchestrator rules{orch}\n\n# Team board: {board}"
+                f"\n\n# Team over recent PRs: mean cost ${mean('cost')}, mean latency {mean('latency_s')} s "
+                "(critical path)\n\n# Credit per type (this and "
                 f"earlier batches)\n{json.dumps(table, indent=1)}\n\n# Post-mortems\n"
                 + "\n\n".join(json.dumps(it) for it in items[:10])
                 + f"\n\nPropose at most {self.cfg.max_edits_per_step} edits.")
@@ -291,17 +318,31 @@ class TeamEvolver:
         c0 = sum(self.cost(t, self.genome) for t in tasks) / len(tasks)
         c1 = sum(self.cost(t, cand) for t in tasks) / len(tasks)
         ratio = c1 / c0 if c0 else 1.0
-        gain_ok = q1 - q0 >= self.cfg.min_gain and ratio <= self.cfg.max_cost_ratio
-        saving_ok = q1 >= q0 and ratio <= 1 - self.cfg.min_saving
+        l0, l1 = self.latencies(tasks, self.genome, cand)
+        lat = l1 / l0 if l0 else 1.0
+        cfg = self.cfg
+        gain_ok = q1 - q0 >= cfg.min_gain and ratio <= cfg.max_cost_ratio
+        saving_ok = q1 >= q0 and ratio <= 1 - cfg.min_saving
+        faster_ok = q1 >= q0 and lat <= 1 - cfg.min_saving and ratio <= cfg.max_cost_ratio
+        accepted = None if lat > cfg.max_latency_ratio else \
+            "quality" if gain_ok else "cost" if saving_ok else "latency" if faster_ok else None
         record["validation"] = {"tasks": [t.id for t in tasks], "quality_before": round(q0, 4),
                                 "quality_after": round(q1, 4), "cost_before": round(c0, 4),
                                 "cost_after": round(c1, 4), "cost_ratio": round(ratio, 3),
-                                "accepted_for": "quality" if gain_ok else "cost" if saving_ok else None}
-        if gain_ok or saving_ok:
+                                "latency_before": round(l0, 1), "latency_after": round(l1, 1),
+                                "latency_ratio": round(lat, 3), "accepted_for": accepted}
+        if accepted:
             self.genome = cand
             record["status"] = "adopted"
             return True
         return False
+
+    def latencies(self, tasks: list[ReplayTask], *genomes: TeamGenome) -> list[float]:
+        """Mean derived latency per genome over `tasks`. Measured tool times only if every episode has them, so
+        episodes cached before durations were recorded are compared on the same (nominal) footing."""
+        traces = [[self.run.trace_of(t, genome=g) for t in tasks] for g in genomes]
+        measured = all(timed(tr) for row in traces for tr in row)
+        return [sum(derived_latency(tr, measured) for tr in row) / len(row) for row in traces]
 
     # ------------------------------------------------------------------ loop
     def learn(self, train: list[ReplayTask]) -> dict[str, Any]:
@@ -315,7 +356,7 @@ class TeamEvolver:
                 cr = episode_credit(self.run.trace_of(t, genome=self.genome), t, self.matcher)
                 self.credits.append((t, cr))
                 self.history.append({"task": t.id, "score": score, "genome": self.genome.id,
-                                     "cost": self.cost(t, self.genome)})
+                                     "cost": self.cost(t, self.genome), "latency_s": cr["orchestrator"].get("latency_s")})
                 if (pm := self.postmortem(t, out, cr)) is not None:
                     items.append(pm)
             self.seen.extend(batch)
@@ -347,10 +388,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--budget", type=float, default=9.0)
     p.add_argument("--out", default=None)
+    p.add_argument("--board", action="store_true", help="start from the seed library with the team board on")
+    p.add_argument("--rubric", default=None, help="compare the seed library with it plus rubric-area specialists "
+                                                  "(a mined rubric's *_skills.json) instead of evolving the team")
     a = p.parse_args(argv)
     log = lambda m: print(m, file=sys.stderr, flush=True)  # noqa: E731
     data = Path(a.data)
     repo = ReplayRepo(data)
+    repo.pool_size = a.workers  # reuse checked-out trees across episodes (ReplayRepo.worktree)
+    atexit.register(repo.close)
     tasks = [t for t in load_tasks(data / "tasks.jsonl") if t.kind == "concern"]
     train = pick([t for t in tasks if t.split == "train"], a.train, newest=True)
     test = pick([t for t in tasks if t.split == "test"], a.test, newest=False)
@@ -360,16 +406,20 @@ def main(argv: list[str] | None = None) -> int:
     reflect = make_llm(a.llm, a.model, meter=meter, cache=JsonlCache(data / "reflect_cache.jsonl"))
     matcher = Matcher(data / "semantic_cache.jsonl")
     seed = seed_library()
+    seed.board = a.board
     run = make_runner(repo, model, meter, data / "learning_cache.jsonl", data / "traces", entry="orchestrator",
                       score_fn=lambda t, out: semantic_score(matcher, t, out), genome=seed)
     evo = TeamEvolver(repo, run, reflect, matcher, seed, TeamEvoConfig(batch=a.batch, workers=a.workers),
                       past=[t for t in tasks if t.split != "test"], log=log)
     t0, stopped = time.time(), None
-    try:
-        evo.learn(train)
-    except BudgetStop as e:
-        stopped = f"during learning: {e}"
-    systems = {"seed_library": seed, "evolved": evo.genome}
+    if a.rubric:
+        systems = {"seed_library": seed, "rubric_team": rubric_team(seed, load_skills(Path(a.rubric)))}
+    else:
+        try:
+            evo.learn(train)
+        except BudgetStop as e:
+            stopped = f"during learning: {e}"
+        systems = {"seed_library": seed, "evolved": evo.genome}
     rows: dict[str, list[dict]] = {s: [] for s in systems}
     test_credits: dict[str, list] = {s: [] for s in systems}
     if stopped is None:
@@ -379,23 +429,27 @@ def main(argv: list[str] | None = None) -> int:
             for (t, s), (score, out) in zip(jobs, outs):
                 from ..replay.concerns import concern_metrics
 
-                rows[s].append({"task": t.id, "score": score, "cost": evo.cost(t, systems[s]),
+                trace = run.trace_of(t, genome=systems[s])
+                rows[s].append({"task": t.id, "score": score, "cost": evo.cost(t, systems[s]), "trace": trace,
                                 **concern_metrics(t, out), **semantic_metrics(matcher, t, out)})
-                test_credits[s].append((t, episode_credit(run.trace_of(t, genome=systems[s]), t, matcher)))
+                test_credits[s].append((t, episode_credit(trace, t, matcher)))
         except BudgetStop as e:
             stopped = f"during evaluation: {e}"
     n = min(len(v) for v in rows.values())
     rows = {s: v[:n] for s, v in rows.items()}
-    wins = sum(1 for x, y in zip(rows["evolved"], rows["seed_library"]) if x["score"] > y["score"] + 1e-9)
-    losses = sum(1 for x, y in zip(rows["evolved"], rows["seed_library"]) if x["score"] < y["score"] - 1e-9)
+    measured = all(timed(r["trace"]) for v in rows.values() for r in v)  # same footing for every system
+    for r in (r for v in rows.values() for r in v):
+        r["latency_s"] = derived_latency(r.pop("trace"), measured)
     result = {"repo": repo.store.meta("repo"), "train_tasks": [t.id for t in train], "test_tasks_evaluated": n,
               "stopped": stopped, "elapsed_s": round(time.time() - t0, 1), "llm": meter.snapshot(),
               "edits": {"proposed": len(evo.edits), "adopted": sum(e["status"] == "adopted" for e in evo.edits),
                         "by_level": {lv: sum(e["level"] == lv for e in evo.edits) for lv in ("agent", "library",
                                                                                             "team")}},
-              "summary": {s: {**summarise(v), "mean_cost": round(sum(r["cost"] or 0 for r in v) / max(1, len(v)), 4)}
+              "summary": {s: {**summarise(v), "mean_cost": round(sum(r["cost"] or 0 for r in v) / max(1, len(v)), 4),
+                              "mean_latency_s": round(sum(r["latency_s"] for r in v) / max(1, len(v)), 1)}
                           for s, v in rows.items()},
-              "paired_evolved_vs_seed": {"wins": wins, "losses": losses, "ties": n - wins - losses},
+              "latency_measured": measured,
+              "paired_vs_seed": paired(rows, "seed_library"),
               "test_credit": {s: credit_table(c[:n]) for s, c in test_credits.items()},
               "genomes": {s: g.to_dict() for s, g in systems.items()}, "rows": rows}
     out_path = Path(a.out or f"data/results/team_evolution_{data.name}.json")

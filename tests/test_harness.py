@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from ospm.harness.agent import SUMMARY_SYSTEM, Agent, AgentConfig, Tool
+from ospm.harness.agent import COMPACTION_INSTRUCTION, Agent, AgentConfig, Tool
 from ospm.harness.env import SUBMIT_MARKER, LocalEnvironment, extract_submission, format_observation
 from ospm.harness.models import (
     AnthropicChat,
@@ -78,12 +78,16 @@ def test_submission_and_observation_format():
 
 
 # ---------------------------------------------------------------------------------------------- agent loop
+def is_summary_request(view) -> bool:
+    return bool(view.transcript) and view.last.get("text") == COMPACTION_INSTRUCTION
+
+
 def scripted(*turns):
     """Policy that plays the given turns in order (summary requests answered separately)."""
     it = iter(turns)
 
     def policy(view):
-        if view.system == SUMMARY_SYSTEM:
+        if is_summary_request(view):
             return "SUMMARY: found the bug in foo.py"
         return next(it)
     return policy
@@ -145,7 +149,7 @@ def test_simple_compaction(env):
     seen = {}
 
     def policy(view):
-        if view.system == SUMMARY_SYSTEM:
+        if is_summary_request(view):
             return "SUMMARY: the failing test is test_x"
         if view.transcript[0].get("compacted"):
             seen["after"] = view.transcript[0]["text"]
@@ -157,6 +161,64 @@ def test_simple_compaction(env):
     assert res.exit_status == "Submitted" and agent.trace.compactions >= 1
     assert "find the bug" in seen["after"] and "SUMMARY: the failing test is test_x" in seen["after"]
     assert any(s.event == "compaction" for s in agent.trace.steps)
+
+
+def test_compaction_extends_the_cached_prefix(env):
+    seen = []
+
+    def policy(view):
+        if is_summary_request(view):
+            seen.append((view.system, [dict(e) for e in view.transcript[:-1]]))
+            return "SUMMARY"
+        if view.transcript[0].get("compacted"):
+            return submit_json({"done": True})
+        return bash_call("python -c \"print('y' * 4000)\"")
+
+    agent = Agent("x", FakeChat(policy), env, AgentConfig("SYS", compaction_tokens=1500, step_limit=10))
+    model_conv = []
+    orig_start = agent.model.start
+    agent.model.start = lambda *a: model_conv.append(orig_start(*a)) or model_conv[-1]
+    agent.run(task="find the bug")
+    system, prefix = seen[0]
+    # the summary request is the agent's own conversation (same system prompt and history) plus one instruction
+    assert system == "SYS" and prefix[0]["text"] == "find the bug" and len(prefix) > 2
+    assert len(model_conv) == 1  # no separate summariser conversation
+    step = next(s for s in agent.trace.steps if s.event == "compaction")
+    assert step.input_tokens > 0 and step.cost >= 0
+
+
+def test_side_query_leaves_the_conversation_unchanged():
+    conv = FakeChat(lambda v: "answer").start("sys", [])
+    conv.add_user("hello")
+    conv.query()
+    before = [dict(e) for e in conv.history]
+    assert conv.side_query("summarise").text == "answer"
+    assert conv.history == before
+
+
+def test_a_truncated_turn_is_resampled_before_it_fails_the_episode():
+    from ospm.harness.models import TRUNCATION_RETRIES, TruncatedTurn
+
+    calls = []
+
+    def flaky(view):
+        calls.append(1)
+        if len(calls) <= TRUNCATION_RETRIES:
+            raise TruncatedTurn("hit max_tokens")
+        return "answer"
+
+    conv = FakeChat(flaky).start("sys", [])
+    conv.add_user("hello")
+    assert conv.query().text == "answer" and len(calls) == TRUNCATION_RETRIES + 1
+    assert [e["role"] for e in conv.history] == ["user", "assistant"]
+
+    def always(view):
+        raise TruncatedTurn("hit max_tokens")
+
+    conv = FakeChat(always).start("sys", [])
+    conv.add_user("hello")
+    with pytest.raises(TruncatedTurn):
+        conv.query()
 
 
 def test_text_mode(env):
@@ -179,20 +241,23 @@ def test_follow_up_send(env):
 
 
 def test_parallel_extra_tools(env):
-    order = []
+    order, spans = [], []
 
     def slow(args, agent):
+        t0 = time.monotonic()
         time.sleep(0.5)
         order.append(args["x"])
+        spans.append((t0, time.monotonic()))
         return f"done {args['x']}"
     spec = ToolSpec("slow", "slow tool", {"type": "object", "properties": {"x": {"type": "string"}},
                                            "required": ["x"], "additionalProperties": False})
     turns = iter([ModelTurn("", [ToolCall("", "slow", {"x": "a"}), ToolCall("", "slow", {"x": "b"})]),
                   submit_json({})])
     agent = Agent("x", FakeChat(lambda v: next(turns)), env, AgentConfig("sys"), tools=[Tool(spec, slow)])
-    t = time.time()
     agent.run(task="t")
-    assert time.time() - t < 0.95 and sorted(order) == ["a", "b"]
+    (a0, a1), (b0, b1) = spans
+    assert a0 < b1 and b0 < a1 and sorted(order) == ["a", "b"]  # the two calls overlapped
+    assert all(r["s"] >= 0.5 for r in agent.trace.steps[0].results)  # each call's duration is recorded
 
 
 # ---------------------------------------------------------------------------------------------- team
@@ -233,7 +298,7 @@ def notes(view, kind=None) -> list[dict]:
 
 def team(orch, child):
     def policy(view):
-        if view.system == SUMMARY_SYSTEM:
+        if is_summary_request(view):
             return "summary"
         return orch(view) if "lead maintainer agent" in view.system else child(view)
     return policy
@@ -610,3 +675,123 @@ def test_message_arriving_while_a_child_submits_resumes_it(tmp_path):
                     if n["type"] == "finished"]
     assert [n["final_message"]["rationale"] for n in finished] == ["second"]  # no lost message, one notification
     sess.shutdown()
+
+
+# ---------------------------------------------------------------------------------------------- stuck / elision
+def stuck_notes(agent) -> list[str]:
+    return [m["text"] for m in agent.conv.view.transcript if m["role"] == "user" and "same command" in m["text"]]
+
+
+def test_stuck_note_after_five_identical_steps_but_a_successful_repeat_is_not_stopped(env):
+    seen = []
+
+    def policy(view):
+        seen.append(any("same command 5 times" in m.get("text", "") for m in view.transcript if m["role"] == "user"))
+        return bash_call("echo same") if n_asst(view) < 10 else submit_json({"ok": 1})
+
+    agent = Agent("x", FakeChat(policy), env, AgentConfig("sys"))
+    res = agent.run(task="t")
+    assert res.exit_status == "Submitted" and res.steps == 11
+    assert seen[:5] == [False] * 5 and seen[5] and len(stuck_notes(agent)) == 1  # nudged once, after the 5th repeat
+    assert [s.event for s in agent.trace.steps].count("stuck") == 1 and "stuck:" in agent.trace.render()
+
+
+def test_a_different_step_resets_the_stuck_streak(env):
+    cmds = ["echo a"] * 4 + ["echo b"] + ["echo a"] * 4
+    agent = Agent("x", FakeChat(scripted(*[bash_call(c) for c in cmds], submit_json({}))), env, AgentConfig("sys"))
+    assert agent.run(task="t").exit_status == "Submitted" and not stuck_notes(agent)
+
+
+def test_same_failing_command_stops_the_agent_with_a_final_turn(env):
+    from ospm.harness.agent import FINAL_TURN
+
+    def final(view):
+        return view.transcript[-1]["text"] == FINAL_TURN if view.transcript[-1]["role"] == "user" else False
+
+    agent = Agent("x", FakeChat(lambda v: submit_json({"partial": 1}) if final(v) else bash_call("exit 3")), env,
+                  AgentConfig("sys"))
+    res = agent.run(task="t")
+    assert res.exit_status == "Submitted" and json.loads(res.submission) == {"partial": 1} and res.steps == 9
+    assert len(stuck_notes(agent)) == 1
+
+    agent = Agent("x", FakeChat(lambda v: bash_call("false")), env, AgentConfig("sys"))
+    res = agent.run(task="t")
+    assert res.exit_status.startswith("LimitsExceeded: stuck") and res.steps == 9
+    off = Agent("x", FakeChat(scripted(*[bash_call("false")] * 9, submit_json({}))), env,
+                AgentConfig("sys", stuck_warn=0, stuck_stop=0))
+    assert off.run(task="t").exit_status == "Submitted" and not stuck_notes(off)
+
+
+def test_conversation_elide_keeps_recent_and_short_outputs():
+    conv = FakeChat(lambda v: "").start("sys", [])
+    conv.add_user("go")
+    conv.add_tool_results([ToolResult(f"c{i}", t) for i, t in enumerate(["a" * 5000, "short", "b" * 3000, "c" * 4000,
+                                                                          "d" * 4000])])
+    conv.last_input_tokens = 10_000
+    removed = conv.elide(keep_last=2, min_chars=1200)
+    texts = [e["text"] for e in conv.view.transcript if e["role"] == "tool"]
+    assert texts[0].startswith("[output elided to save context: 5000 characters") and texts[1] == "short"
+    assert texts[2].startswith("[output elided") and texts[3:] == ["c" * 4000, "d" * 4000]
+    assert removed == 8000 - len(texts[0]) - len(texts[2]) and conv.last_input_tokens == 10_000 - removed // 4
+    assert conv.elide(keep_last=2, min_chars=1200) == 0  # already-elided outputs are left alone
+    conv.last_input_tokens = 5
+    conv.view.transcript.append({"role": "tool", "id": "z", "text": "z" * 5000, "error": False})
+    conv.elide(0, 10)
+    assert conv.last_input_tokens == 0
+
+
+def test_openai_and_anthropic_elide_native_histories():
+    from ospm.harness.models import AnthropicConversation, OpenAIConversation
+
+    oa = OpenAIConversation(OpenAIChat(client=object()), "sys", [])
+    oa.items = [{"role": "user", "content": "go"}, {"type": "function_call", "call_id": "1", "name": "bash"},
+                {"type": "function_call_output", "call_id": "1", "output": "x" * 3000},
+                {"type": "function_call_output", "call_id": "2", "output": "y" * 3000}]
+    oa.last_input_tokens = 2000
+    assert oa.elide(1, 1200) > 2800 and oa.items[3]["output"] == "y" * 3000
+    assert oa.items[2]["output"].startswith("[output elided to save context: 3000 characters")
+    assert oa.items[2]["call_id"] == "1" and oa.items[1]["name"] == "bash" and oa.last_input_tokens < 2000
+
+    an = AnthropicConversation(AnthropicChat(client=object()), "sys", [])
+    an.messages = [{"role": "user", "content": "go"}, {"role": "assistant", "content": [object()]},
+                   {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": "x" * 3000,
+                                                 "is_error": True}, {"type": "text", "text": "note"}]},
+                   {"role": "assistant", "content": [object()]},
+                   {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "b", "is_error": False,
+                                                 "content": [{"type": "text", "text": "y" * 3000}]}]}]
+    assert an.elide(1, 1200) > 2800
+    first = an.messages[2]["content"]
+    assert first[0]["content"].startswith("[output elided") and first[0]["tool_use_id"] == "a" and first[0]["is_error"]
+    assert first[1] == {"type": "text", "text": "note"} and an.messages[4]["content"][0]["content"][0]["text"] == "y" * 3000
+    assert an.elide(1, 1200) == 0
+
+
+def elide_policy(view):
+    return bash_call("python -c \"print('x' * 3000)\" && echo $RANDOM") if n_asst(view) < 5 else submit_json({})
+
+
+def test_agent_records_elision_only_when_enabled(env):
+    agent = Agent("x", FakeChat(elide_policy), env, AgentConfig("sys", elide_tokens=1, elide_keep=2))
+    assert agent.run(task="t").exit_status == "Submitted"
+    events = [s.event for s in agent.trace.steps]
+    assert events.count("elision") >= 1 and "elision: elided" in agent.trace.render()
+    outs = [e["text"] for e in agent.conv.view.transcript if e["role"] == "tool"]
+    assert outs[0].startswith("[output elided") and not outs[-1].startswith("[output elided")
+    off = Agent("x", FakeChat(elide_policy), env, AgentConfig("sys"))
+    off.run(task="t")
+    assert "elision" not in [s.event for s in off.trace.steps]
+
+
+def test_only_team_episodes_elide(tmp_path):
+    from ospm.team.runner import TEAM_ELIDE_TOKENS
+
+    def session(entry):
+        s = TeamSession(seed_team(), FakeChat(lambda v: ""), lambda: LocalEnvironment(cwd=str(tmp_path)), "p", "c")
+        first = s.make_agent(entry)
+        return s, first
+
+    s, orch = session("orchestrator")
+    kid = s.make_agent("triage", parent=orch)
+    assert orch.cfg.elide_tokens == kid.cfg.elide_tokens == TEAM_ELIDE_TOKENS == 64_000
+    s, review = session("review")
+    assert review.cfg.elide_tokens == 0 and s.make_agent("triage", parent=review).cfg.elide_tokens == 0

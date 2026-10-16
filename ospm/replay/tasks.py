@@ -73,12 +73,12 @@ def _split(task_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------------------------- triage
-def changelog_fragments(repo: ReplayRepo, branch: str = "main") -> dict[int, str]:
+def changelog_fragments(repo: ReplayRepo, branch: str | None = None) -> dict[int, str]:
     """issue number -> kind, from changelog fragments added on the main branch (any time up to the mirror)."""
     import subprocess
 
     out = subprocess.run(["git", "--git-dir", str(repo.git_dir), "log", "--diff-filter=A", "--name-only",
-                          "--format=", f"refs/heads/{branch}", "--", "changelog/"], capture_output=True, text=True,
+                          "--format=", f"refs/heads/{branch or repo.default_branch}", "--", "changelog/"], capture_output=True, text=True,
                          encoding="utf-8", errors="replace").stdout
     frags: dict[int, str] = {}
     for line in out.splitlines():
@@ -218,7 +218,7 @@ def review_tasks(repo: ReplayRepo) -> list[ReplayTask]:
         as_of = _minus(first["submitted_at"])
         if repo.committed_after(sha, as_of):
             continue
-        base = repo.base_at(sha, as_of, pr["base_ref"] or "main")
+        base = repo.base_at(sha, as_of, pr["base_ref"] or repo.default_branch)
         if not base:
             continue
         tid = f"review:{pr['number']}@{sha[:8]}"
